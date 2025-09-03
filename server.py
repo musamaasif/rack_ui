@@ -248,6 +248,7 @@ def process_card(reader_index):
     last_present_time_update = 0
     auth_status = -1  # Initialize auth_status to avoid undefined variable error
 
+    logging.info(f"Thread {thread_id}: Starting reader processing")
     while is_running:
         try:
             if not connection:
@@ -689,31 +690,6 @@ def process_card(reader_index):
         except Exception as e:
             logging.error(f"Thread {thread_id}: Error disconnecting reader: {e}")
     gc.collect()
-
-def start_processing():
-    global is_running, threads, READER_INDEX_MAPPING
-    with data_lock:
-        if not is_running:
-            is_running = True
-            try:
-                system_readers = readers()
-                READER_INDEX_MAPPING = {i: i for i in range(min(NUM_CARDS, len(system_readers)))}
-                threads = []
-                for i in range(NUM_CARDS):
-                    t = threading.Thread(target=process_card, args=(i,))
-                    t.start()
-                    threads.append(t)
-                    time.sleep(0.05)
-                watcher_thread = threading.Thread(target=reader_watcher)
-                watcher_thread.start()
-                threads.append(watcher_thread)
-                logging.info(f"Started processing for all readers at {time.strftime('%H:%M:%S', time.localtime())}")
-            except Exception as e:
-                logging.error(f"Failed to start processing: {e}")
-                is_running = False
-                threads = []
-                return False
-    return True
 
 def stop_processing():
     global is_running, threads
