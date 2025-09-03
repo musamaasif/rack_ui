@@ -251,103 +251,104 @@ def process_card(reader_index):
     while is_running:
         try:
             if not connection:
-            connection = connect_reader(reader_index)
-            if not connection:
+                connection = connect_reader(reader_index)
+                if not connection:
+                    with data_lock:
+                        history_entry = {
+                            "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
+                            "readerIndex": reader_index,
+                            "status": "Disconnected",
+                            "companyName": "N/A",
+                            "atr": "N/A",
+                            "authentication": "Unknown",
+                            "presentTime": "N/A"
+                        }
+                        if not history_data or history_entry != history_data[-1]:
+                            history_data.append(history_entry)
+                        reader_data[reader_index].update({
+                            "status": "Disconnected",
+                            "presentTime": "N/A",
+                            "cardInsertTime": None,
+                            "atr": "N/A",
+                            "companyName": "N/A",
+                            "authentication": "Unknown"
+                        })
+                    company_name = None
+                    time.sleep(5)  # Increased delay to 5 seconds after failed connection
+                    continue
+
+                # Attempt ATR reading and handle failure
+                try:
+                    atr = toHexString(connection.getATR())
+                    logging.info(f"Thread {thread_id}: Read ATR: {atr}")
+                    identifier_parts = []
+                    for i, apdu in enumerate(APDU_COMMANDS):
+                        data, status = execute_apdu(connection, apdu, thread_id)
+                        if data is None or status != "9000":
+                            logging.error(f"Thread {thread_id}: APDU {apdu} failed with status: {status}")
+                            break
+                        if i in [1, 3]:
+                            identifier_parts.append(data)
+                    if len(identifier_parts) == 2:
+                        combined_identifier = "".join(identifier_parts)
+                        logging.info(f"Thread {thread_id}: Combined identifier: {combined_identifier}")
+                    else:
+                        logging.error(f"Thread {thread_id}: Failed to collect identifier parts")
+                        connection.disconnect()
+                        connection = None
+                        continue
+                except Exception as e:
+                    logging.error(f"Thread {thread_id}: Error reading ATR or APDUs: {e}")
+                    connection.disconnect()
+                    connection = None
+                    continue
+
                 with data_lock:
                     history_entry = {
                         "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
                         "readerIndex": reader_index,
-                        "status": "Disconnected",
+                        "status": "Connected",
                         "companyName": "N/A",
-                        "atr": "N/A",
+                        "atr": combined_identifier,
                         "authentication": "Unknown",
-                        "presentTime": "N/A"
+                        "presentTime": format_duration(0)
                     }
                     if not history_data or history_entry != history_data[-1]:
                         history_data.append(history_entry)
-                    reader_data[reader_index].update({
-                        "status": "Disconnected",
-                        "presentTime": "N/A",
-                        "cardInsertTime": None,
-                        "atr": "N/A",
+                    reader_data[thread_id].update({
+                        "status": "Connected",
+                        "atr": combined_identifier,
+                        "presentTime": format_duration(0),
+                        "cardInsertTime": time.time(),
                         "companyName": "N/A",
                         "authentication": "Unknown"
                     })
-                company_name = None
-                time.sleep(5)  # Increased delay to 5 seconds after failed connection
-                continue
 
-            # Attempt ATR reading and handle failure
-            try:
-                atr = toHexString(connection.getATR())
-                logging.info(f"Thread {thread_id}: Read ATR: {atr}")
-                identifier_parts = []
-                for i, apdu in enumerate(APDU_COMMANDS):
-                    data, status = execute_apdu(connection, apdu, thread_id)
-                    if data is None or status != "9000":
-                        logging.error(f"Thread {thread_id}: APDU {apdu} failed with status: {status}")
-                        break
-                    if i in [1, 3]:
-                        identifier_parts.append(data)
-                if len(identifier_parts) == 2:
-                    combined_identifier = "".join(identifier_parts)
-                    logging.info(f"Thread {thread_id}: Combined identifier: {combined_identifier}")
-                else:
-                    logging.error(f"Thread {thread_id}: Failed to collect identifier parts")
+                sock = create_socket(thread_id)
+                if not sock:
                     connection.disconnect()
                     connection = None
+                    with data_lock:
+                        reader_data[thread_id].update({
+                            "status": "Disconnected",
+                            "presentTime": "N/A",
+                            "cardInsertTime": None,
+                            "atr": "N/A",
+                            "companyName": "N/A",
+                            "authentication": "Unknown"
+                        })
+                    time.sleep(REQUEST_INTERVAL)
                     continue
-            except Exception as e:
-                logging.error(f"Thread {thread_id}: Error reading ATR or APDUs: {e}")
-                connection.disconnect()
-                connection = None
-                continue
 
-            with data_lock:
-                history_entry = {
-                    "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
-                    "readerIndex": reader_index,
-                    "status": "Connected",
-                    "companyName": "N/A",
-                    "atr": combined_identifier,
-                    "authentication": "Unknown",
-                    "presentTime": format_duration(0)
-                }
-                if not history_data or history_entry != history_data[-1]:
-                    history_data.append(history_entry)
-                reader_data[thread_id].update({
-                    "status": "Connected",
-                    "atr": combined_identifier,
-                    "presentTime": format_duration(0),
-                    "cardInsertTime": time.time(),
-                    "companyName": "N/A",
-                    "authentication": "Unknown"
-                })
+                send_card_status(sock, combined_identifier, thread_id, "inserted", vehicle_schedule_id)
 
-            sock = create_socket(thread_id)
-            if not sock:
-                connection.disconnect()
-                connection = None
-                with data_lock:
-                    reader_data[thread_id].update({
-                        "status": "Disconnected",
-                        "presentTime": "N/A",
-                        "cardInsertTime": None,
-                        "atr": "N/A",
-                        "companyName": "N/A",
-                        "authentication": "Unknown"
-                    })
-                time.sleep(REQUEST_INTERVAL)
-                continue
-
-    send_card_status(sock, combined_identifier, thread_id, "inserted", vehicle_schedule_id)
-
-            # Update present time
+            # Update present time every 15 seconds
             with data_lock:
                 if reader_data[thread_id]["cardInsertTime"]:
                     current_time = time.time()
-                    if current_time - last_present_time_update >= 30:
+                    if current_time - last_present_time_update >= 15:
                         reader_data[thread_id]["presentTime"] = format_duration(current_time - reader_data[thread_id]["cardInsertTime"])
+                        logging.debug(f"Thread {thread_id}: Updated presentTime to {reader_data[thread_id]['presentTime']} for reader {reader_index}")
                         history_entry = {
                             "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
                             "readerIndex": reader_index,
@@ -688,19 +689,6 @@ def process_card(reader_index):
         except Exception as e:
             logging.error(f"Thread {thread_id}: Error disconnecting reader: {e}")
     gc.collect()
-
-def reader_watcher():
-    while is_running:
-        try:
-            current_readers = readers()
-            if len(current_readers) != len(READER_INDEX_MAPPING):
-                logging.info("Reader change detected; re-enumerating.")
-                with data_lock:
-                    READER_INDEX_MAPPING = {i: i for i in range(min(NUM_CARDS, len(current_readers)))}
-        except Exception as e:
-            logging.error(f"Watcher error: {e}")
-        time.sleep(60)
-        gc.collect()
 
 def start_processing():
     global is_running, threads, READER_INDEX_MAPPING
