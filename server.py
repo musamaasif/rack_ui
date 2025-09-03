@@ -86,7 +86,7 @@ def format_duration(seconds):
 def connect_reader(reader_index):
     """Connect to a specific reader by index with retry logic."""
     max_attempts = 3
-    timeout_seconds = 10  # Increased timeout to 10 seconds
+    timeout_seconds = 15  # Increased to 15 seconds for stability
 
     for attempt in range(max_attempts):
         try:
@@ -97,7 +97,7 @@ def connect_reader(reader_index):
             if mapped_index >= len(reader_list):
                 raise ValueError(f"No reader available for mapped index {mapped_index}")
             reader_name = reader_list[mapped_index].name
-            logging.info(f"Thread {reader_index}: Attempt {attempt + 1}/{max_attempts} - Attempting to connect to reader: {reader_name}")
+            logging.info(f"Thread {reader_index}: Attempt {attempt + 1}/{max_attempts} - Attempting to connect to {reader_name}")
             
             connection = reader_list[mapped_index].createConnection()
             observer = ConsoleCardConnectionObserver()
@@ -106,28 +106,27 @@ def connect_reader(reader_index):
             while time.time() - start_time < timeout_seconds:
                 try:
                     connection.connect()
-                    logging.info(f"Thread {reader_index}: Successfully connected to reader {reader_name} on attempt {attempt + 1}")
+                    logging.info(f"Thread {reader_index}: Successfully connected to {reader_name} on attempt {attempt + 1}")
                     break
                 except Exception as e:
                     logging.debug(f"Thread {reader_index}: Connection attempt failed: {e}")
-                    time.sleep(0.1)
+                    time.sleep(0.2)  # Increased sleep for stability
             else:
-                logging.error(f"Thread {reader_index}: Timeout connecting to reader {reader_name} after {timeout_seconds} seconds (Attempt {attempt + 1}/{max_attempts})")
+                logging.error(f"Thread {reader_index}: Timeout connecting to {reader_name} after {timeout_seconds}s (Attempt {attempt + 1}/{max_attempts})")
                 continue
 
-            # Attempt to read ATR after successful connection
             try:
                 atr = toHexString(connection.getATR())
-                logging.info(f"Thread {reader_index}: Connected to reader {reader_name} with ATR: {atr}")
+                logging.info(f"Thread {reader_index}: Connected to {reader_name} with ATR: {atr}")
                 return connection
             except Exception as e:
-                logging.error(f"Thread {reader_index}: Failed to read ATR from reader {reader_name}: {e}")
+                logging.error(f"Thread {reader_index}: Failed to read ATR from {reader_name}: {e}")
                 connection.disconnect()
                 continue
 
         except Exception as e:
             logging.error(f"Thread {reader_index}: Reader connection error on attempt {attempt + 1}: {e}")
-            time.sleep(1)  # Wait before next attempt
+            time.sleep(1)
     logging.error(f"Thread {reader_index}: Failed to connect after {max_attempts} attempts")
     return None
 
@@ -691,27 +690,49 @@ def process_card(reader_index):
             logging.error(f"Thread {thread_id}: Error disconnecting reader: {e}")
     gc.collect()
 
+def start_processing():
+    """Start processing threads for all readers."""
+    global is_running, threads
+    if is_running:
+        logging.warning("Processing already running, skipping start")
+        return False
+    is_running = True
+    with data_lock:
+        threads = []
+        for i in range(NUM_CARDS):
+            thread = threading.Thread(target=process_card, args=(i,), daemon=True)
+            threads.append(thread)
+            thread.start()
+            logging.info(f"Started processing thread for reader index {i}")
+    return True
+
 def stop_processing():
+    """Stop all processing threads and reset state."""
     global is_running, threads
     with data_lock:
-        if is_running:
-            is_running = False
-            for thread in threads:
-                thread.join()
-            threads = []
-            for i in range(NUM_CARDS):
-                reader_data[i] = {
-                    "readerIndex": i,
-                    "status": "Disconnected",
-                    "companyName": "N/A",
-                    "atr": "N/A",
-                    "authentication": "Unknown",
-                    "presentTime": "N/A",
-                    "cardInsertTime": None
-                }
-            history_data.clear()
-            logging.info(f"Stopped processing for all readers at {time.strftime('%H:%M:%S', time.localtime())}")
-            gc.collect()
+        if not is_running:
+            logging.warning("Processing not running, skipping stop")
+            return
+        is_running = False
+        for thread in threads:
+            if thread.is_alive():
+                thread.join(timeout=5)
+                if thread.is_alive():
+                    logging.warning(f"Thread for reader {threads.index(thread)} failed to join, forcing termination")
+        threads = []
+        for i in range(NUM_CARDS):
+            reader_data[i] = {
+                "readerIndex": i,
+                "status": "Disconnected",
+                "companyName": "N/A",
+                "atr": "N/A",
+                "authentication": "Unknown",
+                "presentTime": "N/A",
+                "cardInsertTime": None
+            }
+        history_data.clear()
+        logging.info(f"Stopped processing for all readers at {time.strftime('%H:%M:%S', time.localtime())}")
+        gc.collect()
 
 @app.route('/')
 def index():
@@ -813,6 +834,6 @@ def handle_disconnect():
     logging.info(f"Client disconnected from /logs namespace at {time.strftime('%H:%M:%S', time.localtime())}")
 
 if __name__ == "__main__":
-    # Tune GC for low-memory device
-    gc.set_threshold(700, 10, 10)  # More frequent collections
+    gc.set_threshold(500, 5, 5)  # Adjusted for 981Mi total memory
+    start_processing()  # Start processing on boot
     socketio.run(app, debug=False, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)
