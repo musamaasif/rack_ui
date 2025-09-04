@@ -9,7 +9,6 @@ from logging.handlers import RotatingFileHandler
 from smartcard.System import readers
 from smartcard.util import toHexString, toBytes
 from smartcard.CardConnectionObserver import ConsoleCardConnectionObserver
-from collections import deque
 import gc
 
 app = Flask(__name__)
@@ -18,29 +17,28 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 # Custom SocketIO Handler for emitting logs
 class SocketIOHandler(logging.Handler):
     def emit(self, record):
-        if record.levelno >= logging.WARNING:  # Only emit WARNING and ERROR
-            try:
-                msg = self.format(record)
-                socketio.emit('log_message', {'data': msg}, namespace='/logs')
-            except Exception as e:
-                print(f"SocketIOHandler error: {e}")
+        try:
+            msg = self.format(record)
+            socketio.emit('log_message', {'data': msg}, namespace='/logs')
+        except Exception as e:
+            print(f"SocketIOHandler error: {e}")
 
 # Configure root logger
-logging.getLogger('').setLevel(logging.INFO)
+logging.getLogger('').setLevel(logging.DEBUG)
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
-# File handler for disk logging (rotates at 1MB, keeps 5 backups)
-file_handler = RotatingFileHandler('server.log', maxBytes=1_000_000, backupCount=5)
-file_handler.setLevel(logging.INFO)
-file_handler.setFormatter(formatter)
+# Console handler for terminal output
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.DEBUG)
+console_handler.setFormatter(formatter)
 
 # SocketIO handler for streaming to logs.html
 socketio_handler = SocketIOHandler()
-socketio_handler.setLevel(logging.WARNING)  # Restrict to WARNING/ERROR
+socketio_handler.setLevel(logging.DEBUG)
 socketio_handler.setFormatter(formatter)
 
-# Add handlers to root logger (no console handler to reduce I/O)
-logging.getLogger('').addHandler(file_handler)
+# Add handlers to root logger
+logging.getLogger('').addHandler(console_handler)
 logging.getLogger('').addHandler(socketio_handler)
 
 # Configuration
@@ -53,12 +51,11 @@ APDU_COMMANDS = [
     "00A4020C020005",  # Select application 2
     "00B0000008"       # Read second identifier part
 ]
-REQUEST_INTERVAL = 5
+REQUEST_INTERVAL = 1
 NUM_CARDS = 16
-SOCKET_RETRY_INTERVAL = 5
-SOCKET_RETRY_TIMEOUT = 60000
+SOCKET_RETRY_INTERVAL = 5  # Seconds between retry attempts
+SOCKET_RETRY_TIMEOUT = 60  # Total retry duration in seconds
 READER_INDEX_MAPPING = {}
-HISTORY_LIMIT = 100  # Reduced to 100 to save memory
 
 # Shared reader data
 reader_data = {i: {
@@ -73,7 +70,8 @@ reader_data = {i: {
 is_running = False
 threads = []
 data_lock = threading.Lock()
-history_data = deque(maxlen=HISTORY_LIMIT)
+history_data = []
+HISTORY_LIMIT = 1000
 
 def format_duration(seconds):
     if seconds is None:
@@ -84,106 +82,92 @@ def format_duration(seconds):
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 def connect_reader(reader_index):
-    """Connect to a specific reader by index with retry logic."""
-    max_attempts = 3
-    timeout_seconds = 15  # Increased to 15 seconds for stability
-
-    for attempt in range(max_attempts):
-        try:
-            reader_list = readers()
-            if not reader_list:
-                raise ValueError("No readers detected")
-            mapped_index = READER_INDEX_MAPPING.get(reader_index, reader_index)
-            if mapped_index >= len(reader_list):
-                raise ValueError(f"No reader available for mapped index {mapped_index}")
-            reader_name = reader_list[mapped_index].name
-            logging.info(f"Thread {reader_index}: Attempt {attempt + 1}/{max_attempts} - Attempting to connect to {reader_name}")
-            
-            connection = reader_list[mapped_index].createConnection()
-            observer = ConsoleCardConnectionObserver()
-            connection.addObserver(observer)
-            start_time = time.time()
-            while time.time() - start_time < timeout_seconds:
-                try:
-                    connection.connect()
-                    logging.info(f"Thread {reader_index}: Successfully connected to {reader_name} on attempt {attempt + 1}")
-                    break
-                except Exception as e:
-                    logging.debug(f"Thread {reader_index}: Connection attempt failed: {e}")
-                    time.sleep(0.2)  # Increased sleep for stability
-            else:
-                logging.error(f"Thread {reader_index}: Timeout connecting to {reader_name} after {timeout_seconds}s (Attempt {attempt + 1}/{max_attempts})")
-                continue
-
+    """Connect to a specific smart card reader by index, ARM safe."""
+    try:
+        reader_list = readers()
+        if not reader_list:
+            raise ValueError("No readers detected")
+        mapped_index = READER_INDEX_MAPPING.get(reader_index, reader_index)
+        if mapped_index >= len(reader_list):
+            raise ValueError(f"No reader available for mapped index {mapped_index}")
+        reader_name = reader_list[mapped_index].name
+        logging.info(f"Thread {reader_index}: Attempting to connect to reader: {reader_name}")
+        connection = reader_list[mapped_index].createConnection()
+        observer = ConsoleCardConnectionObserver()
+        connection.addObserver(observer)
+        # Sequential connect with timeout (ARM safe)
+        timeout_seconds = 5
+        start_time = time.time()
+        while time.time() - start_time < timeout_seconds:
             try:
-                atr = toHexString(connection.getATR())
-                logging.info(f"Thread {reader_index}: Connected to {reader_name} with ATR: {atr}")
-                return connection
-            except Exception as e:
-                logging.error(f"Thread {reader_index}: Failed to read ATR from {reader_name}: {e}")
-                connection.disconnect()
-                continue
-
-        except Exception as e:
-            logging.error(f"Thread {reader_index}: Reader connection error on attempt {attempt + 1}: {e}")
-            time.sleep(1)
-    logging.error(f"Thread {reader_index}: Failed to connect after {max_attempts} attempts")
-    return None
+                connection.connect()
+                break
+            except Exception:
+                time.sleep(0.1)
+        else:
+            logging.error(f"Thread {reader_index}: Timeout connecting to reader {reader_name}")
+            return None
+        atr = toHexString(connection.getATR())
+        logging.info(f"Thread {reader_index}: Connected to reader {reader_name} with ATR: {atr}")
+        return connection
+    except Exception as e:
+        logging.error(f"Thread {reader_index}: Reader connection error: {e}")
+        return None
 
 def execute_apdu(connection, apdu, thread_id):
+    """Execute an APDU command and return response data and status."""
     try:
         data, sw1, sw2 = connection.transmit(toBytes(apdu))
         status = f"{sw1:02X}{sw2:02X}"
+        logging.debug(f"Thread {thread_id}: APDU {apdu} response: {toHexString(data)}, status: {status}")
         return toHexString(data).replace(" ", ""), status
     except Exception as e:
         logging.error(f"Thread {thread_id}: APDU execution error for {apdu}: {e}")
         return None, None
 
 def create_socket(thread_id):
+    """Create and connect a TCP socket to the server with retries for 1 minute."""
     start_time = time.time()
     while time.time() - start_time < SOCKET_RETRY_TIMEOUT:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(5)
             sock.connect((SERVER_IP, SERVER_PORT))
+            logging.info(f"Thread {thread_id}: Connected to server {SERVER_IP}:{SERVER_PORT}")
+            # Enable TCP keep-alive
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 30)
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)
-            logging.info(f"Thread {thread_id}: Connected to server {SERVER_IP}:{SERVER_PORT} with keep-alive")
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)  # Start keep-alive after 60 seconds
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)  # Interval between probes
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)     # Number of probes
             return sock
         except socket.error as e:
-            logging.error(f"Thread {thread_id}: Socket connection error: {e}. Retrying...")
+            logging.error(f"Thread {thread_id}: Socket connection error: {e}. Retrying in {SOCKET_RETRY_INTERVAL} seconds...")
             time.sleep(SOCKET_RETRY_INTERVAL)
-    logging.error(f"Thread {thread_id}: Failed to connect after {SOCKET_RETRY_TIMEOUT}s")
+    logging.error(f"Thread {thread_id}: Failed to connect to server after {SOCKET_RETRY_TIMEOUT} seconds")
     return None
 
 def send_receive(sock, payload, operation, thread_id):
-    retries = 0
-    max_retries = 3
-    while retries < max_retries:
+    """Send a payload to the server and receive the response."""
+    try:
+        sock.sendall(payload)
+        logging.debug(f"Thread {thread_id}: Sent payload for {operation}: {payload.decode()}")
+        response = sock.recv(4096).decode().strip()
+        json_start = response.find('{')
+        if json_start == -1:
+            logging.error(f"Thread {thread_id}: No JSON found in {operation} response: {response}")
+            return None
+        json_data = response[json_start:]
         try:
-            sock.sendall(payload)
-            response = sock.recv(4096).decode().strip()
-            json_start = response.find('{')
-            if json_start == -1:
-                logging.error(f"Thread {thread_id}: No JSON in {operation} response: {response}")
-                return None
-            json_data = response[json_start:]
             return json.loads(json_data)
-        except socket.error as e:
-            logging.error(f"Thread {thread_id}: Socket error during {operation} (retry {retries+1}/{max_retries}): {e}")
-            retries += 1
-            time.sleep(1)
-            if sock:
-                sock.close()
-            sock = create_socket(thread_id)
-            if not sock:
-                return None
-    logging.error(f"Thread {thread_id}: Max retries exceeded for {operation}")
-    return None
+        except json.JSONDecodeError as e:
+            logging.error(f"Thread {thread_id}: JSON parsing error for {operation}: {e}, Response: {json_data}")
+            return None
+    except socket.error as e:
+        logging.error(f"Thread {thread_id}: Socket error during {operation}: {e}")
+        return None
 
 def send_identifier(sock, identifier, thread_id, vehicle_schedule_id=None):
+    """Send identifier to server and return response data."""
     payload_data = {"atr": identifier, "app_id": APP_ID, "reader_no": thread_id + 1}
     if vehicle_schedule_id is not None:
         payload_data["vehicle_schedule_id"] = vehicle_schedule_id
@@ -191,6 +175,7 @@ def send_identifier(sock, identifier, thread_id, vehicle_schedule_id=None):
     return send_receive(sock, payload, "send_identifier", thread_id)
 
 def fetch_company_name(sock, identifier, thread_id, vehicle_schedule_id=None):
+    """Fetch company name from server using get_company_card message."""
     payload_data = {"atr": identifier, "reader_no": thread_id + 1, "app_id": APP_ID}
     if vehicle_schedule_id is not None:
         payload_data["vehicle_schedule_id"] = vehicle_schedule_id
@@ -201,17 +186,26 @@ def fetch_company_name(sock, identifier, thread_id, vehicle_schedule_id=None):
         if company_name:
             logging.info(f"Thread {thread_id}: Received company name: {company_name}")
             return company_name
+        logging.warning(f"Thread {thread_id}: No company name received for ATR {identifier}, response: {response_data}")
+    else:
+        logging.error(f"Thread {thread_id}: Invalid response from fetch_company_name: {response_data}")
     return None
 
 def send_card_status(sock, identifier, thread_id, status, vehicle_schedule_id=None):
+    """Send card status (inserted/removed) to server and log the response."""
     payload_data = {"atr": identifier, "reader_no": thread_id + 1, "app_id": APP_ID}
     if vehicle_schedule_id is not None:
         payload_data["vehicle_schedule_id"] = vehicle_schedule_id
     payload = json.dumps({"type": f"card_{status}", "data": payload_data}).encode()
     response_data = send_receive(sock, payload, f"send_card_status_{status}", thread_id)
+    if response_data:
+        logging.info(f"Thread {thread_id}: Card {status} payload sent successfully: {response_data}")
+    else:
+        logging.error(f"Thread {thread_id}: Failed to send card {status} payload")
     return response_data
 
 def fetch_apdu_from_server(sock, identifier, thread_id, response_data=None, status=None, pre_apdu=None, vehicle_schedule_id=None):
+    """Fetch APDU from server for authentication."""
     payload_data = {"atr": identifier, "app_id": APP_ID, "reader_no": thread_id + 1}
     if status is not None and response_data is not None:
         payload_data["response"] = response_data + status
@@ -228,25 +222,11 @@ def fetch_apdu_from_server(sock, identifier, thread_id, response_data=None, stat
     if response_data and isinstance(response_data.get("data"), dict):
         data_apdu = response_data["data"]
         if data_apdu:
+            logging.debug(f"Thread {thread_id}: Received APDU: {data_apdu}")
             return data_apdu
+        logging.error(f"Thread {thread_id}: No APDU received or invalid response data format")
     return None
 
-
-def start_processing():
-    """Start processing threads for all readers."""
-    global is_running, threads
-    if is_running:
-        logging.warning("Processing already running, skipping start")
-        return False
-    is_running = True
-    with data_lock:
-        threads = []
-        for i in range(NUM_CARDS):
-            thread = threading.Thread(target=process_card, args=(i,), daemon=True)
-            threads.append(thread)
-            thread.start()
-            logging.info(f"Started processing thread for reader index {i}")
-    return True
 def process_card(reader_index):
     """Process a single card in a separate thread."""
     thread_id = reader_index
@@ -728,135 +708,89 @@ def process_card(reader_index):
         except Exception as e:
             logging.error(f"Thread {thread_id}: Error disconnecting reader: {e}")
     gc.collect()
-    
-def stop_processing():
-    """Stop all processing threads and reset state."""
+
+def start_processing():
+    """Start processing threads for all card readers."""
     global is_running, threads
-    with data_lock:
-        if not is_running:
-            logging.warning("Processing not running, skipping stop")
-            return
-        is_running = False
-        for thread in threads:
-            if thread.is_alive():
-                thread.join(timeout=5)
-                if thread.is_alive():
-                    logging.warning(f"Thread for reader {threads.index(thread)} failed to join, forcing termination")
-        threads = []
-        for i in range(NUM_CARDS):
-            reader_data[i] = {
-                "readerIndex": i,
-                "status": "Disconnected",
-                "companyName": "N/A",
-                "atr": "N/A",
-                "authentication": "Unknown",
-                "presentTime": "N/A",
-                "cardInsertTime": None
-            }
-        history_data.clear()
-        logging.info(f"Stopped processing for all readers at {time.strftime('%H:%M:%S', time.localtime())}")
-        gc.collect()
+    if is_running:
+        logging.warning("Processing already running")
+        return
+    is_running = True
+    system_readers = readers()
+    if not system_readers:
+        logging.error("No smart card readers detected")
+        return
+    active_readers = min(NUM_CARDS, len(system_readers))
+    logging.info(f"Starting processing for {active_readers} readers")
+    for i in range(active_readers):
+        thread = threading.Thread(target=process_card, args=(i,))
+        threads.append(thread)
+        thread.start()
+    logging.info(f"Started {len(threads)} threads")
+
+def stop_processing():
+    """Stop all processing threads."""
+    global is_running, threads
+    if not is_running:
+        logging.warning("Processing not running")
+        return
+    is_running = False
+    for thread in threads:
+        thread.join(timeout=5)
+    threads = []
+    logging.info("All processing threads stopped")
 
 @app.route('/')
 def index():
+    """Serve the main HTML page."""
     return render_template('index.html')
 
 @app.route('/readers')
 def get_readers():
-    try:
-        with data_lock:
-            data = [{k: v for k, v in reader.items() if k != "cardInsertTime"} for reader in reader_data.values()]
-        return jsonify({"status": "success", "data": data})
-    except Exception as e:
-        logging.error(f"Error in get_readers at {time.strftime('%H:%M:%S', time.localtime())}: {e}")
-        return jsonify({"status": "error", "message": str(e), "data": []}), 500
+    """Return current reader data as JSON."""
+    with data_lock:
+        return jsonify(reader_data)
 
 @app.route('/history')
 def get_history():
-    try:
-        reader_index = request.args.get('readerIndex', type=int)
-        with data_lock:
-            if reader_index is not None:
-                filtered = [entry for entry in history_data if entry.get('readerIndex') == reader_index]
-                return jsonify({"status": "success", "data": filtered})
-            else:
-                return jsonify({"status": "success", "data": list(history_data)})
-    except Exception as e:
-        logging.error(f"Error in get_history: {e}")
-        return jsonify({"status": "error", "message": str(e), "data": []}), 500
+    """Return history data as JSON."""
+    with data_lock:
+        return jsonify(history_data)
 
 @app.route('/download_history')
 def download_history():
+    """Generate and return history data as a CSV file."""
+    with data_lock:
+        output = io.StringIO()
+        writer = csv.writer(output)
+        headers = ["Timestamp", "ReaderIndex", "Status", "CompanyName", "ATR", "Authentication", "PresentTime"]
+        writer.writerow(headers)
+        for entry in history_data:
+            row = [entry.get(key, "N/A") for key in headers[:-1]] + [entry.get("presentTime", "N/A")]
+            writer.writerow(row)
+        output.seek(0)
+        return send_file(
+            io.BytesIO(output.getvalue().encode()),
+            mimetype='text/csv',
+            as_attachment=True,
+            attachment_filename='history_data.csv'
+        )
+
+@app.route('/clear_history', methods=['POST'])
+def clear_history():
+    """Clear history data."""
+    with data_lock:
+        global history_data
+        history_data = []
+        return jsonify({"status": "success", "message": "History cleared"})
+
+if __name__ == '__main__':
     try:
-        with data_lock:
-            output = io.StringIO()
-            writer = csv.DictWriter(output, fieldnames=["timestamp", "readerIndex", "status", "companyName", "atr", "authentication", "presentTime"])
-            writer.writeheader()
-            for entry in history_data:
-                writer.writerow(entry)
-            output.seek(0)
-            return send_file(
-                io.BytesIO(output.getvalue().encode('utf-8')),
-                mimetype='text/csv',
-                as_attachment=True,
-                download_name='history.csv'
-            )
-    except Exception as e:
-        logging.error(f"Error in download_history: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-@app.route('/login', methods=['POST'])
-def login():
-    try:
-        data = request.get_json()
-        if data is None:
-            logging.error(f"Login failed at {time.strftime('%H:%M:%S', time.localtime())}: No JSON data received")
-            return jsonify({"status": "error", "message": "Request must be application/json"}), 415
-
-        username = data.get('username')
-        password = data.get('password')
-
-        if username == 'techvezoto' and password == 'techvezoto@1122':
-            if start_processing():
-                logging.info(f"Login successful at {time.strftime('%H:%M:%S', time.localtime())}, processing started")
-                return jsonify({"status": "success"})
-            else:
-                logging.error(f"Login failed at {time.strftime('%H:%M:%S', time.localtime())}: Processing failed to start")
-                return jsonify({"status": "error", "message": "Failed to start reader processing"}), 500
-
-        logging.warning(f"Login failed at {time.strftime('%H:%M:%S', time.localtime())}: Invalid credentials")
-        return jsonify({"status": "error", "message": "Invalid username or password"}), 401
-    except Exception as e:
-        logging.error(f"Error in login at {time.strftime('%H:%M:%S', time.localtime())}: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-@app.route('/logout', methods=['POST'])
-def logout():
-    try:
+        start_processing()
+        socketio.run(app, host='0.0.0.0', port=5000, debug=False)
+    except KeyboardInterrupt:
         stop_processing()
-        logging.info(f"Logout successful at {time.strftime('%H:%M:%S', time.localtime())}, processing stopped")
-        return jsonify({"status": "success"})
+        logging.info("Server stopped by user")
     except Exception as e:
-        logging.error(f"Error in logout at {time.strftime('%H:%M:%S', time.localtime())}: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-@app.route('/graphs.html')
-def graphs():
-    return render_template('graphs.html')
-
-@app.route('/logs.html')
-def logs():
-    return render_template('logs.html')
-
-@socketio.on('connect', namespace='/logs')
-def handle_connect():
-    logging.info(f"Client connected to /logs namespace at {time.strftime('%H:%M:%S', time.localtime())}")
-
-@socketio.on('disconnect', namespace='/logs')
-def handle_disconnect():
-    logging.info(f"Client disconnected from /logs namespace at {time.strftime('%H:%M:%S', time.localtime())}")
-
-if __name__ == "__main__":
-    gc.set_threshold(500, 5, 5)  # Adjusted for 981Mi total memory
-    start_processing()  # Start processing on boot
-    socketio.run(app, debug=False, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)
+        logging.error(f"Server error: {e}")
+        stop_processing()
