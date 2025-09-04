@@ -231,6 +231,22 @@ def fetch_apdu_from_server(sock, identifier, thread_id, response_data=None, stat
             return data_apdu
     return None
 
+
+def start_processing():
+    """Start processing threads for all readers."""
+    global is_running, threads
+    if is_running:
+        logging.warning("Processing already running, skipping start")
+        return False
+    is_running = True
+    with data_lock:
+        threads = []
+        for i in range(NUM_CARDS):
+            thread = threading.Thread(target=process_card, args=(i,), daemon=True)
+            threads.append(thread)
+            thread.start()
+            logging.info(f"Started processing thread for reader index {i}")
+    return True
 def process_card(reader_index):
     """Process a single card in a separate thread."""
     thread_id = reader_index
@@ -245,11 +261,22 @@ def process_card(reader_index):
     company_fetched = False
     last_activity = time.time()
     last_present_time_update = 0
-    auth_status = -1  # Initialize auth_status to avoid undefined variable error
+    last_reader_check = time.time()  # For dynamic reader handling
+    last_reconnect_check = time.time()  # For keep-alive
 
     logging.info(f"Thread {thread_id}: Starting reader processing")
     while is_running:
         try:
+            # Dynamic Reader Handling: Re-enumerate readers every 5 minutes
+            if time.time() - last_reader_check >= 300:
+                reader_list = readers()
+                if not reader_list and connection:
+                    logging.warning(f"Thread {thread_id}: No readers detected, disconnecting")
+                    if connection:
+                        connection.disconnect()
+                        connection = None
+                last_reader_check = time.time()
+
             if not connection:
                 connection = connect_reader(reader_index)
                 if not connection:
@@ -342,11 +369,23 @@ def process_card(reader_index):
 
                 send_card_status(sock, combined_identifier, thread_id, "inserted", vehicle_schedule_id)
 
-            # Update present time every 15 seconds
+            # Keep-Alive & Reconnect: Check connection every 30 minutes
+            if time.time() - last_reconnect_check >= 1800:
+                try:
+                    connection.reconnect()
+                    logging.info(f"Thread {thread_id}: Successfully reconnected to reader")
+                except Exception as e:
+                    logging.warning(f"Thread {thread_id}: Reconnect failed: {e}")
+                    if connection:
+                        connection.disconnect()
+                        connection = None
+                last_reconnect_check = time.time()
+
+            # Update present time every 1 second for smoother display
             with data_lock:
                 if reader_data[thread_id]["cardInsertTime"]:
                     current_time = time.time()
-                    if current_time - last_present_time_update >= 15:
+                    if current_time - last_present_time_update >= 1:  # Update every 1 second
                         reader_data[thread_id]["presentTime"] = format_duration(current_time - reader_data[thread_id]["cardInsertTime"])
                         logging.debug(f"Thread {thread_id}: Updated presentTime to {reader_data[thread_id]['presentTime']} for reader {reader_index}")
                         history_entry = {
@@ -689,23 +728,7 @@ def process_card(reader_index):
         except Exception as e:
             logging.error(f"Thread {thread_id}: Error disconnecting reader: {e}")
     gc.collect()
-
-def start_processing():
-    """Start processing threads for all readers."""
-    global is_running, threads
-    if is_running:
-        logging.warning("Processing already running, skipping start")
-        return False
-    is_running = True
-    with data_lock:
-        threads = []
-        for i in range(NUM_CARDS):
-            thread = threading.Thread(target=process_card, args=(i,), daemon=True)
-            threads.append(thread)
-            thread.start()
-            logging.info(f"Started processing thread for reader index {i}")
-    return True
-
+    
 def stop_processing():
     """Stop all processing threads and reset state."""
     global is_running, threads
