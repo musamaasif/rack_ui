@@ -9,6 +9,7 @@ from logging.handlers import RotatingFileHandler
 from smartcard.System import readers
 from smartcard.util import toHexString, toBytes
 from smartcard.CardConnectionObserver import ConsoleCardConnectionObserver
+from collections import deque
 import gc
 
 app = Flask(__name__)
@@ -54,7 +55,7 @@ APDU_COMMANDS = [
 REQUEST_INTERVAL = 1
 NUM_CARDS = 16
 SOCKET_RETRY_INTERVAL = 5  # Seconds between retry attempts
-SOCKET_RETRY_TIMEOUT = 60  # Total retry duration in seconds
+SOCKET_RETRY_TIMEOUT = 60000  # Total retry duration in seconds
 READER_INDEX_MAPPING = {}
 
 # Shared reader data
@@ -70,8 +71,7 @@ reader_data = {i: {
 is_running = False
 threads = []
 data_lock = threading.Lock()
-history_data = []
-HISTORY_LIMIT = 1000
+history_data = deque(maxlen=1000)
 
 def format_duration(seconds):
     if seconds is None:
@@ -133,17 +133,12 @@ def create_socket(thread_id):
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(5)
             sock.connect((SERVER_IP, SERVER_PORT))
-            logging.info(f"Thread {thread_id}: Connected to server {SERVER_IP}:{SERVER_PORT}")
-            # Enable TCP keep-alive
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)  # Start keep-alive after 60 seconds
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)  # Interval between probes
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)     # Number of probes
+            print(f"Thread {thread_id}: Connected to server {SERVER_IP}:{SERVER_PORT}")
             return sock
         except socket.error as e:
-            logging.error(f"Thread {thread_id}: Socket connection error: {e}. Retrying in {SOCKET_RETRY_INTERVAL} seconds...")
+            print(f"Thread {thread_id}: Socket connection error: {e}. Retrying in {SOCKET_RETRY_INTERVAL} seconds...")
             time.sleep(SOCKET_RETRY_INTERVAL)
-    logging.error(f"Thread {thread_id}: Failed to connect to server after {SOCKET_RETRY_TIMEOUT} seconds")
+    print(f"Thread {thread_id}: Failed to connect to server after {SOCKET_RETRY_TIMEOUT} seconds")
     return None
 
 def send_receive(sock, payload, operation, thread_id):
@@ -176,7 +171,7 @@ def send_identifier(sock, identifier, thread_id, vehicle_schedule_id=None):
 
 def fetch_company_name(sock, identifier, thread_id, vehicle_schedule_id=None):
     """Fetch company name from server using get_company_card message."""
-    payload_data = {"atr": identifier, "reader_no": thread_id + 1, "app_id": APP_ID}
+    payload_data = {"atr": identifier, "reader_no": thread_id + 1,"app_id": APP_ID,}
     if vehicle_schedule_id is not None:
         payload_data["vehicle_schedule_id"] = vehicle_schedule_id
     payload = json.dumps({"type": "get_company_card", "data": payload_data}).encode()
@@ -193,10 +188,10 @@ def fetch_company_name(sock, identifier, thread_id, vehicle_schedule_id=None):
 
 def send_card_status(sock, identifier, thread_id, status, vehicle_schedule_id=None):
     """Send card status (inserted/removed) to server and log the response."""
-    payload_data = {"atr": identifier, "reader_no": thread_id + 1, "app_id": APP_ID}
+    payload_data = {"atr": identifier, "reader_no": thread_id + 1,"app_id": APP_ID,}
     if vehicle_schedule_id is not None:
         payload_data["vehicle_schedule_id"] = vehicle_schedule_id
-    payload = json.dumps({"type": f"card_{status}", "data": payload_data}).encode()
+    payload = json.dumps({"type": f"card_{status}" , "data": payload_data}).encode()
     response_data = send_receive(sock, payload, f"send_card_status_{status}", thread_id)
     if response_data:
         logging.info(f"Thread {thread_id}: Card {status} payload sent successfully: {response_data}")
@@ -237,30 +232,14 @@ def process_card(reader_index):
     has_reconnected = False
     prev_auth_status = -1
     combined_identifier = None
-    last_auth_status = None
-    company_fetched = False
-    last_activity = time.time()
-    last_present_time_update = 0
-    last_reader_check = time.time()  # For dynamic reader handling
-    last_reconnect_check = time.time()  # For keep-alive
 
-    logging.info(f"Thread {thread_id}: Starting reader processing")
-    while is_running:
-        try:
-            # Dynamic Reader Handling: Re-enumerate readers every 5 minutes
-            if time.time() - last_reader_check >= 300:
-                reader_list = readers()
-                if not reader_list and connection:
-                    logging.warning(f"Thread {thread_id}: No readers detected, disconnecting")
-                    if connection:
-                        connection.disconnect()
-                        connection = None
-                last_reader_check = time.time()
-
+    try:
+        while is_running:
             if not connection:
                 connection = connect_reader(reader_index)
                 if not connection:
                     with data_lock:
+                        # Store history when reader disconnects
                         history_entry = {
                             "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
                             "readerIndex": reader_index,
@@ -270,47 +249,79 @@ def process_card(reader_index):
                             "authentication": "Unknown",
                             "presentTime": "N/A"
                         }
-                        if not history_data or history_entry != history_data[-1]:
-                            history_data.append(history_entry)
-                        reader_data[reader_index].update({
-                            "status": "Disconnected",
-                            "presentTime": "N/A",
-                            "cardInsertTime": None,
-                            "atr": "N/A",
-                            "companyName": "N/A",
-                            "authentication": "Unknown"
-                        })
+                        history_data.append(history_entry)
+                        if len(history_data) > HISTORY_LIMIT:
+                            history_data.pop(0)
+                        reader_data[reader_index]["status"] = "Disconnected"
+                        reader_data[reader_index]["presentTime"] = "N/A"
+                        reader_data[reader_index]["cardInsertTime"] = None
+                        reader_data[reader_index]["atr"] = "N/A"
+                        reader_data[reader_index]["companyName"] = "N/A"
+                        reader_data[reader_index]["authentication"] = "Unknown"
                     company_name = None
-                    time.sleep(5)  # Increased delay to 5 seconds after failed connection
+                    time.sleep(REQUEST_INTERVAL)
                     continue
 
-                # Attempt ATR reading and handle failure
-                try:
-                    atr = toHexString(connection.getATR())
-                    logging.info(f"Thread {thread_id}: Read ATR: {atr}")
-                    identifier_parts = []
-                    for i, apdu in enumerate(APDU_COMMANDS):
-                        data, status = execute_apdu(connection, apdu, thread_id)
-                        if data is None or status != "9000":
-                            logging.error(f"Thread {thread_id}: APDU {apdu} failed with status: {status}")
-                            break
-                        if i in [1, 3]:
-                            identifier_parts.append(data)
-                    if len(identifier_parts) == 2:
-                        combined_identifier = "".join(identifier_parts)
-                        logging.info(f"Thread {thread_id}: Combined identifier: {combined_identifier}")
-                    else:
-                        logging.error(f"Thread {thread_id}: Failed to collect identifier parts")
+                identifier_parts = []
+                for i, apdu in enumerate(APDU_COMMANDS):
+                    data, status = execute_apdu(connection, apdu, thread_id)
+                    if data is None or status != "9000":
+                        logging.error(f"Thread {thread_id}: APDU {apdu} failed with status: {status}")
+                        with data_lock:
+                            # Store history on APDU failure
+                            history_entry = {
+                                "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
+                                "readerIndex": reader_index,
+                                "status": "Disconnected",
+                                "companyName": "N/A",
+                                "atr": "N/A",
+                                "authentication": "Unknown",
+                                "presentTime": "N/A"
+                            }
+                            history_data.append(history_entry)
+                            if len(history_data) > HISTORY_LIMIT:
+                                history_data.pop(0)
+                            reader_data[thread_id]["status"] = "Disconnected"
+                            reader_data[thread_id]["presentTime"] = "N/A"
+                            reader_data[thread_id]["cardInsertTime"] = None
+                            reader_data[thread_id]["companyName"] = "N/A"
                         connection.disconnect()
                         connection = None
-                        continue
-                except Exception as e:
-                    logging.error(f"Thread {thread_id}: Error reading ATR or APDUs: {e}")
+                        company_name = None
+                        time.sleep(REQUEST_INTERVAL)
+                        break
+                    if i in [1, 3]:
+                        identifier_parts.append(data)
+
+                if len(identifier_parts) != 2:
+                    logging.error(f"Thread {thread_id}: Failed to collect both identifier parts")
+                    with data_lock:
+                        # Store history on identifier failure
+                        history_entry = {
+                            "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
+                            "readerIndex": reader_index,
+                            "status": "Disconnected",
+                            "companyName": "N/A",
+                            "atr": "N/A",
+                            "authentication": "Unknown",
+                            "presentTime": "N/A"
+                        }
+                        history_data.append(history_entry)
+                        if len(history_data) > HISTORY_LIMIT:
+                            history_data.pop(0)
+                        reader_data[thread_id]["status"] = "Disconnected"
+                        reader_data[thread_id]["presentTime"] = "N/A"
+                        reader_data[thread_id]["cardInsertTime"] = None
+                        reader_data[thread_id]["companyName"] = "N/A"
                     connection.disconnect()
                     connection = None
+                    company_name = None
+                    time.sleep(REQUEST_INTERVAL)
                     continue
 
+                combined_identifier = "".join(identifier_parts)
                 with data_lock:
+                    # Store history on successful connection
                     history_entry = {
                         "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
                         "readerIndex": reader_index,
@@ -320,86 +331,73 @@ def process_card(reader_index):
                         "authentication": "Unknown",
                         "presentTime": format_duration(0)
                     }
-                    if not history_data or history_entry != history_data[-1]:
-                        history_data.append(history_entry)
-                    reader_data[thread_id].update({
-                        "status": "Connected",
-                        "atr": combined_identifier,
-                        "presentTime": format_duration(0),
-                        "cardInsertTime": time.time(),
-                        "companyName": "N/A",
-                        "authentication": "Unknown"
-                    })
+                    history_data.append(history_entry)
+                    if len(history_data) > HISTORY_LIMIT:
+                        history_data.pop(0)
+                    reader_data[thread_id]["status"] = "Connected"
+                    reader_data[thread_id]["atr"] = combined_identifier
+                    reader_data[thread_id]["presentTime"] = format_duration(0)
+                    reader_data[thread_id]["cardInsertTime"] = time.time()
+                    reader_data[thread_id]["companyName"] = "N/A"
 
                 sock = create_socket(thread_id)
                 if not sock:
-                    connection.disconnect()
-                    connection = None
                     with data_lock:
-                        reader_data[thread_id].update({
-                            "status": "Disconnected",
-                            "presentTime": "N/A",
-                            "cardInsertTime": None,
-                            "atr": "N/A",
-                            "companyName": "N/A",
-                            "authentication": "Unknown"
-                        })
-                    time.sleep(REQUEST_INTERVAL)
-                    continue
-
-                send_card_status(sock, combined_identifier, thread_id, "inserted", vehicle_schedule_id)
-
-            # Keep-Alive & Reconnect: Check connection every 30 minutes
-            if time.time() - last_reconnect_check >= 1800:
-                try:
-                    connection.reconnect()
-                    logging.info(f"Thread {thread_id}: Successfully reconnected to reader")
-                except Exception as e:
-                    logging.warning(f"Thread {thread_id}: Reconnect failed: {e}")
-                    if connection:
-                        connection.disconnect()
-                        connection = None
-                last_reconnect_check = time.time()
-
-            # Update present time every 1 second for smoother display
-            with data_lock:
-                if reader_data[thread_id]["cardInsertTime"]:
-                    current_time = time.time()
-                    if current_time - last_present_time_update >= 1:  # Update every 1 second
-                        reader_data[thread_id]["presentTime"] = format_duration(current_time - reader_data[thread_id]["cardInsertTime"])
-                        logging.debug(f"Thread {thread_id}: Updated presentTime to {reader_data[thread_id]['presentTime']} for reader {reader_index}")
+                        # Store history on socket failure
                         history_entry = {
                             "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
                             "readerIndex": reader_index,
-                            "status": reader_data[thread_id]["status"],
-                            "companyName": reader_data[thread_id]["companyName"],
-                            "atr": reader_data[thread_id]["atr"],
-                            "authentication": reader_data[thread_id]["authentication"],
-                            "presentTime": reader_data[thread_id]["presentTime"]
+                            "status": "Disconnected",
+                            "companyName": "N/A",
+                            "atr": "N/A",
+                            "authentication": "Unknown",
+                            "presentTime": "N/A"
                         }
-                        if not history_data or history_entry != history_data[-1]:
-                            history_data.append(history_entry)
-                        last_present_time_update = current_time
+                        history_data.append(history_entry)
+                        if len(history_data) > HISTORY_LIMIT:
+                            history_data.pop(0)
+                        reader_data[thread_id]["status"] = "Disconnected"
+                        reader_data[thread_id]["presentTime"] = "N/A"
+                        reader_data[thread_id]["cardInsertTime"] = None
+                        reader_data[thread_id]["companyName"] = "N/A"
+                    connection.disconnect()
+                    connection = None
+                    company_name = None
+                    time.sleep(REQUEST_INTERVAL)
+                    continue
+
+                # Send card inserted status
+                send_card_status(sock, combined_identifier, thread_id, "inserted", vehicle_schedule_id)
+
+            with data_lock:
+                if reader_data[thread_id]["cardInsertTime"]:
+                    reader_data[thread_id]["presentTime"] = format_duration(time.time() - reader_data[thread_id]["cardInsertTime"])
+                    # Store history on time update
+                    history_entry = {
+                        "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
+                        "readerIndex": reader_index,
+                        "status": reader_data[thread_id]["status"],
+                        "companyName": reader_data[thread_id]["companyName"],
+                        "atr": reader_data[thread_id]["atr"],
+                        "authentication": reader_data[thread_id]["authentication"],
+                        "presentTime": reader_data[thread_id]["presentTime"]
+                    }
+                    history_data.append(history_entry)
+                    if len(history_data) > HISTORY_LIMIT:
+                        history_data.pop(0)
                 else:
                     reader_data[thread_id]["presentTime"] = "N/A"
 
             # Check connection status
-            if connection and time.time() - last_activity > 3600:
-                logging.info(f"Thread {thread_id}: Idle timeout; reconnecting.")
-                try:
-                    connection.disconnect()
-                except:
-                    pass
-                connection = connect_reader(reader_index)
-                last_activity = time.time()
-
             try:
                 connection.getATR()
             except Exception as e:
                 logging.error(f"Thread {thread_id}: Error during getATR: {e}")
+                # Send card removed status
                 if sock and combined_identifier:
                     send_card_status(sock, combined_identifier, thread_id, "removed", vehicle_schedule_id)
                 with data_lock:
+                    # Store history on card removal
                     history_entry = {
                         "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
                         "readerIndex": reader_index,
@@ -409,16 +407,15 @@ def process_card(reader_index):
                         "authentication": "Unknown",
                         "presentTime": "N/A"
                     }
-                    if not history_data or history_entry != history_data[-1]:
-                        history_data.append(history_entry)
-                    reader_data[thread_id].update({
-                        "status": "Card Removed",
-                        "presentTime": "N/A",
-                        "cardInsertTime": None,
-                        "atr": "N/A",
-                        "authentication": "Unknown",
-                        "companyName": "N/A"
-                    })
+                    history_data.append(history_entry)
+                    if len(history_data) > HISTORY_LIMIT:
+                        history_data.pop(0)
+                    reader_data[thread_id]["status"] = "Card Removed"
+                    reader_data[thread_id]["presentTime"] = "N/A"
+                    reader_data[thread_id]["cardInsertTime"] = None
+                    reader_data[thread_id]["atr"] = "N/A"
+                    reader_data[thread_id]["authentication"] = "Unknown"
+                    reader_data[thread_id]["companyName"] = "N/A"
                 if connection:
                     connection.disconnect()
                     connection = None
@@ -431,7 +428,12 @@ def process_card(reader_index):
                 time.sleep(REQUEST_INTERVAL)
                 continue
 
-            # Fetch authentication status
+            # Caching: Only fetch if status changed or not fetched
+            if auth_status == last_auth_status and company_fetched:
+                time.sleep(REQUEST_INTERVAL)
+                gc.collect()
+                continue
+
             response_data = send_identifier(sock, combined_identifier, thread_id, vehicle_schedule_id)
             if not response_data:
                 logging.error(f"Thread {thread_id}: Failed to retrieve server response, attempting to reconnect")
@@ -439,17 +441,28 @@ def process_card(reader_index):
                     sock.close()
                 sock = create_socket(thread_id)
                 if not sock:
+                    with data_lock:
+                        # Store history on reconnect failure
+                        history_entry = {
+                            "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
+                            "readerIndex": reader_index,
+                            "status": "Disconnected",
+                            "companyName": "N/A",
+                            "atr": "N/A",
+                            "authentication": "Unknown",
+                            "presentTime": "N/A"
+                        }
+                        history_data.append(history_entry)
+                        if len(history_data) > HISTORY_LIMIT:
+                            history_data.pop(0)
+                        reader_data[thread_id]["status"] = "Disconnected"
+                        reader_data[thread_id]["presentTime"] = "N/A"
+                        reader_data[thread_id]["cardInsertTime"] = None
+                        reader_data[thread_id]["companyName"] = "N/A"
                     connection.disconnect()
                     connection = None
-                    with data_lock:
-                        reader_data[thread_id].update({
-                            "status": "Disconnected",
-                            "presentTime": "N/A",
-                            "cardInsertTime": None,
-                            "atr": "N/A",
-                            "companyName": "N/A",
-                            "authentication": "Unknown"
-                        })
+                    company_name = None
+                    combined_identifier = None
                     time.sleep(REQUEST_INTERVAL)
                     continue
                 time.sleep(REQUEST_INTERVAL)
@@ -457,15 +470,13 @@ def process_card(reader_index):
 
             if isinstance(response_data.get("data"), dict):
                 vehicle_schedule_id = response_data["data"].get("vehicle_schedule_id")
+                if vehicle_schedule_id:
+                    logging.debug(f"Thread {thread_id}: Received vehicle_schedule_id: {vehicle_schedule_id}")
 
             auth_status = response_data.get("data", {}).get(combined_identifier.lower(), -1)
             with data_lock:
-                reader_data[thread_id]["authentication"] = (
-                    "No Authentication Required" if auth_status == 0 else
-                    "Authentication Required" if auth_status == 1 else
-                    f"Authentication Failed ({auth_status})" if auth_status > 1 else
-                    "Unknown"
-                )
+                reader_data[thread_id]["authentication"] = "Unknown"
+                # Store history on unknown authentication
                 history_entry = {
                     "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
                     "readerIndex": reader_index,
@@ -475,322 +486,198 @@ def process_card(reader_index):
                     "authentication": reader_data[thread_id]["authentication"],
                     "presentTime": reader_data[thread_id]["presentTime"]
                 }
-                if not history_data or history_entry != history_data[-1]:
-                    history_data.append(history_entry)
-
-            if auth_status == 1:
-                logging.info(f"Thread {thread_id}: Authentication required")
-                with data_lock:
-                    reader_data[thread_id]["status"] = "Connected"
-                    history_entry = {
-                        "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
-                        "readerIndex": reader_index,
-                        "status": reader_data[thread_id]["status"],
-                        "companyName": reader_data[thread_id]["companyName"],
-                        "atr": reader_data[thread_id]["atr"],
-                        "authentication": reader_data[thread_id]["authentication"],
-                        "presentTime": reader_data[thread_id]["presentTime"]
-                    }
-                    if not history_data or history_entry != history_data[-1]:
-                        history_data.append(history_entry)
-                data_apdu = fetch_apdu_from_server(sock, combined_identifier, thread_id, vehicle_schedule_id=vehicle_schedule_id)
-                if not data_apdu:
-                    logging.error(f"Thread {thread_id}: Failed to fetch APDU")
-                    time.sleep(REQUEST_INTERVAL)
-                    continue
-                apdu = data_apdu.get('apdu')
-                vehicle_schedule_id = data_apdu.get('vehicle_schedule_id', vehicle_schedule_id)
-
-                iter_count = 0
-                max_iters = 20
-                while apdu and apdu != "00000000000000" and iter_count < max_iters:
-                    iter_count += 1
-                    if apdu == "11111111111111":
-                        data_apdu = fetch_apdu_from_server(sock, combined_identifier, thread_id, vehicle_schedule_id=vehicle_schedule_id)
-                        if not data_apdu:
-                            break
-                        apdu = data_apdu.get('apdu')
-                        vehicle_schedule_id = data_apdu.get('vehicle_schedule_id', vehicle_schedule_id)
-                        continue
-
-                    data, status = execute_apdu(connection, apdu, thread_id)
-                    if data is None or status is None:
-                        logging.error(f"Thread {thread_id}: Authentication APDU {apdu} failed with status: {status}")
-                        with data_lock:
-                            history_entry = {
-                                "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
-                                "readerIndex": reader_index,
-                                "status": "Disconnected",
-                                "companyName": "N/A",
-                                "atr": "N/A",
-                                "authentication": "Unknown",
-                                "presentTime": "N/A"
-                            }
-                            if not history_data or history_entry != history_data[-1]:
-                                history_data.append(history_entry)
-                            reader_data[thread_id].update({
-                                "status": "Disconnected",
-                                "presentTime": "N/A",
-                                "cardInsertTime": None,
-                                "companyName": "N/A"
-                            })
-                        connection.disconnect()
-                        connection = None
-                        company_name = None
-                        combined_identifier = None
-                        break
-                    data_apdu = fetch_apdu_from_server(sock, combined_identifier, thread_id, response_data=data, status=status, pre_apdu=apdu, vehicle_schedule_id=vehicle_schedule_id)
-                    if not data_apdu:
-                        break
-                    apdu = data_apdu.get('apdu')
-                    vehicle_schedule_id = data_apdu.get('vehicle_schedule_id', vehicle_schedule_id)
-
-                if apdu == "00000000000000":
-                    data, status = execute_apdu(connection, apdu, thread_id)
-                    if data is None or status is None:
-                        logging.error(f"Thread {thread_id}: Final APDU {apdu} failed with status: {status}")
-                    else:
-                        logging.info(f"Thread {thread_id}: Authentication successfully completed")
-                        with data_lock:
-                            history_entry = {
-                                "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
-                                "readerIndex": reader_index,
-                                "status": "Connected",
-                                "companyName": "N/A",
-                                "atr": reader_data[thread_id]["atr"],
-                                "authentication": "No Authentication Required",
-                                "presentTime": format_duration(0)
-                            }
-                            if not history_data or history_entry != history_data[-1]:
-                                history_data.append(history_entry)
-                            reader_data[thread_id].update({
-                                "status": "Connected",
-                                "authentication": "No Authentication Required",
-                                "cardInsertTime": time.time(),
-                                "presentTime": format_duration(0),
-                                "companyName": "N/A"
-                            })
-                        connection.disconnect()
-                        connection = None
-                        connection = connect_reader(reader_index)
-                        if not connection:
-                            with data_lock:
-                                reader_data[thread_id].update({
-                                    "status": "Disconnected",
-                                    "presentTime": "N/A",
-                                    "cardInsertTime": None,
-                                    "atr": "N/A",
-                                    "companyName": "N/A",
-                                    "authentication": "Unknown"
-                                })
-                            company_name = None
-                            combined_identifier = None
-                            break
-                        has_reconnected = True
-            elif auth_status == 0:
-                logging.info(f"Thread {thread_id}: No authentication required")
-                with data_lock:
-                    reader_data[thread_id]["status"] = "Card-Connected"
-                    if not reader_data[thread_id]["cardInsertTime"]:
-                        reader_data[thread_id]["cardInsertTime"] = time.time()
-                        reader_data[thread_id]["presentTime"] = format_duration(0)
-                    history_entry = {
-                        "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
-                        "readerIndex": reader_index,
-                        "status": reader_data[thread_id]["status"],
-                        "companyName": reader_data[thread_id]["companyName"],
-                        "atr": reader_data[thread_id]["atr"],
-                        "authentication": reader_data[thread_id]["authentication"],
-                        "presentTime": reader_data[thread_id]["presentTime"]
-                    }
-                    if not history_data or history_entry != history_data[-1]:
-                        history_data.append(history_entry)
-                company_name = fetch_company_name(sock, combined_identifier, thread_id, vehicle_schedule_id)
-                with data_lock:
-                    reader_data[thread_id]["companyName"] = company_name if company_name else "N/A"
-                    history_entry = {
-                        "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
-                        "readerIndex": reader_index,
-                        "status": reader_data[thread_id]["status"],
-                        "companyName": reader_data[thread_id]["companyName"],
-                        "atr": reader_data[thread_id]["atr"],
-                        "authentication": reader_data[thread_id]["authentication"],
-                        "presentTime": reader_data[thread_id]["presentTime"]
-                    }
-                    if not history_data or history_entry != history_data[-1]:
-                        history_data.append(history_entry)
-                has_reconnected = False
-            elif auth_status > 1 and not has_reconnected and prev_auth_status <= 1:
-                logging.info(f"Thread {thread_id}: Authentication status changed to {auth_status} > 1, disconnecting and reconnecting")
-                with data_lock:
-                    history_entry = {
-                        "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
-                        "readerIndex": reader_index,
-                        "status": "Disconnected",
-                        "companyName": "N/A",
-                        "atr": "N/A",
-                        "authentication": reader_data[thread_id]["authentication"],
-                        "presentTime": "N/A"
-                    }
-                    if not history_data or history_entry != history_data[-1]:
-                        history_data.append(history_entry)
-                    reader_data[thread_id].update({
-                        "status": "Disconnected",
-                        "presentTime": "N/A",
-                        "cardInsertTime": None,
-                        "companyName": "N/A"
-                    })
-                connection.disconnect()
-                connection = connect_reader(reader_index)
-                if not connection:
-                    with data_lock:
-                        reader_data[thread_id].update({
-                            "status": "Disconnected",
-                            "presentTime": "N/A",
-                            "cardInsertTime": None,
-                            "atr": "N/A",
-                            "companyName": "N/A",
-                            "authentication": "Unknown"
-                        })
-                    company_name = None
-                    combined_identifier = None
-                    time.sleep(REQUEST_INTERVAL)
-                    continue
-                has_reconnected = True
-            elif auth_status > 1 and has_reconnected:
-                pass
-            elif auth_status > 1 and prev_auth_status > 1:
-                pass
-            else:
-                with data_lock:
-                    reader_data[thread_id]["authentication"] = "Unknown"
-                    history_entry = {
-                        "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
-                        "readerIndex": reader_index,
-                        "status": reader_data[thread_id]["status"],
-                        "companyName": reader_data[thread_id]["companyName"],
-                        "atr": reader_data[thread_id]["atr"],
-                        "authentication": reader_data[thread_id]["authentication"],
-                        "presentTime": reader_data[thread_id]["presentTime"]
-                    }
-                    if not history_data or history_entry != history_data[-1]:
-                        history_data.append(history_entry)
+                history_data.append(history_entry)
+                if len(history_data) > HISTORY_LIMIT:
+                    history_data.pop(0)
                 has_reconnected = False
 
             prev_auth_status = auth_status
-            last_auth_status = auth_status
-            company_fetched = True if auth_status == 0 else False
-            last_activity = time.time()
-            time.sleep(REQUEST_INTERVAL)
-            gc.collect()
-        except Exception as e:
-            logging.error(f"Thread {thread_id}: Loop error, resetting: {e}")
-            if sock:
-                sock.close()
-                sock = None
-            if connection:
-                try:
-                    connection.disconnect()
-                except:
-                    pass
-                connection = None
-            time.sleep(5)
-            gc.collect()
-            continue
 
-    if sock:
-        sock.close()
-        logging.info(f"Thread {thread_id}: Socket closed")
-    if connection:
-        try:
-            connection.disconnect()
-            logging.info(f"Thread {thread_id}: Reader disconnected")
+            time.sleep(REQUEST_INTERVAL)
         except Exception as e:
-            logging.error(f"Thread {thread_id}: Error disconnecting reader: {e}")
-    gc.collect()
+            logging.error(f"Thread {thread_id}: Unexpected error: {e}")
+            with data_lock:
+                # Store history on unexpected error
+                history_entry = {
+                    "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
+                    "readerIndex": reader_index,
+                    "status": "Disconnected",
+                    "companyName": "N/A",
+                    "atr": "N/A",
+                    "authentication": "Unknown",
+                    "presentTime": "N/A"
+                }
+                history_data.append(history_entry)
+                if len(history_data) > HISTORY_LIMIT:
+                    history_data.pop(0)
+                reader_data[thread_id]["status"] = "Disconnected"
+                reader_data[thread_id]["presentTime"] = "N/A"
+                reader_data[thread_id]["cardInsertTime"] = None
+                reader_data[thread_id]["companyName"] = "N/A"
+            company_name = None
+            combined_identifier = None
+    finally:
+        if sock:
+            sock.close()
+            logging.info(f"Thread {thread_id}: Socket closed")
+        if connection:
+            try:
+                connection.disconnect()
+                logging.info(f"Thread {thread_id}: Reader disconnected")
+            except Exception as e:
+                logging.error(f"Thread {thread_id}: Error disconnecting reader: {e}")
 
 def start_processing():
-    """Start processing threads for all card readers."""
-    global is_running, threads
-    if is_running:
-        logging.warning("Processing already running")
-        return
-    is_running = True
-    system_readers = readers()
-    if not system_readers:
-        logging.error("No smart card readers detected")
-        return
-    active_readers = min(NUM_CARDS, len(system_readers))
-    logging.info(f"Starting processing for {active_readers} readers")
-    for i in range(active_readers):
-        thread = threading.Thread(target=process_card, args=(i,))
-        threads.append(thread)
-        thread.start()
-    logging.info(f"Started {len(threads)} threads")
+    """Start processing threads for all readers."""
+    global is_running, threads, READER_INDEX_MAPPING
+    with data_lock:
+        if not is_running:
+            is_running = True
+            try:
+                system_readers = readers()
+                READER_INDEX_MAPPING = {i: i for i in range(min(NUM_CARDS, len(system_readers)))}
+                threads = []
+                for i in range(NUM_CARDS):
+                    t = threading.Thread(target=process_card, args=(i,))
+                    t.start()
+                    threads.append(t)
+                    time.sleep(0.05)  # small delay between threads to prevent ARM block
+                logging.info(f"Started processing for all readers at {time.strftime('%H:%M:%S', time.localtime())}")
+            except Exception as e:
+                logging.error(f"Failed to start processing: {e}")
+                is_running = False
+                threads = []
+                return False
+    return True
 
 def stop_processing():
-    """Stop all processing threads."""
+    """Stop all processing threads and reset state."""
     global is_running, threads
-    if not is_running:
-        logging.warning("Processing not running")
-        return
-    is_running = False
-    for thread in threads:
-        thread.join(timeout=5)
-    threads = []
-    logging.info("All processing threads stopped")
+    with data_lock:
+        if is_running:
+            is_running = False
+            for thread in threads:
+                thread.join()
+            threads = []
+            for i in range(NUM_CARDS):
+                reader_data[i] = {
+                    "readerIndex": i,
+                    "status": "Disconnected",
+                    "companyName": "N/A",
+                    "atr": "N/A",
+                    "authentication": "Unknown",
+                    "presentTime": "N/A",
+                    "cardInsertTime": None
+                }
+            history_data.clear()
+            logging.info(f"Stopped processing for all readers at {time.strftime('%H:%M:%S', time.localtime())}")
 
 @app.route('/')
 def index():
-    """Serve the main HTML page."""
     return render_template('index.html')
 
 @app.route('/readers')
 def get_readers():
-    """Return current reader data as JSON."""
-    with data_lock:
-        return jsonify(reader_data)
+    try:
+        with data_lock:
+            data = [{k: v for k, v in reader.items() if k != "cardInsertTime"} for reader in reader_data.values()]
+            logging.debug(f"Serving reader data at {time.strftime('%H:%M:%S', time.localtime())}: {data}")
+        return jsonify({"status": "success", "data": data})
+    except Exception as e:
+        logging.error(f"Error in get_readers at {time.strftime('%H:%M:%S', time.localtime())}: {e}")
+        return jsonify({"status": "error", "message": str(e), "data": []}), 500
 
 @app.route('/history')
 def get_history():
-    """Return history data as JSON."""
-    with data_lock:
-        return jsonify(history_data)
+    try:
+        reader_index = request.args.get('readerIndex', type=int)
+        with data_lock:
+            if reader_index is not None:
+                # Only return history for the requested reader index
+                filtered = [entry for entry in history_data if entry.get('readerIndex') == reader_index]
+                return jsonify({"status": "success", "data": filtered})
+            else:
+                return jsonify({"status": "success", "data": history_data})
+    except Exception as e:
+        logging.error(f"Error in get_history: {e}")
+        return jsonify({"status": "error", "message": str(e), "data": []}), 500
 
 @app.route('/download_history')
 def download_history():
-    """Generate and return history data as a CSV file."""
-    with data_lock:
-        output = io.StringIO()
-        writer = csv.writer(output)
-        headers = ["Timestamp", "ReaderIndex", "Status", "CompanyName", "ATR", "Authentication", "PresentTime"]
-        writer.writerow(headers)
-        for entry in history_data:
-            row = [entry.get(key, "N/A") for key in headers[:-1]] + [entry.get("presentTime", "N/A")]
-            writer.writerow(row)
-        output.seek(0)
-        return send_file(
-            io.BytesIO(output.getvalue().encode()),
-            mimetype='text/csv',
-            as_attachment=True,
-            attachment_filename='history_data.csv'
-        )
-
-@app.route('/clear_history', methods=['POST'])
-def clear_history():
-    """Clear history data."""
-    with data_lock:
-        global history_data
-        history_data = []
-        return jsonify({"status": "success", "message": "History cleared"})
-
-if __name__ == '__main__':
     try:
-        start_processing()
-        socketio.run(app, host='0.0.0.0', port=5000, debug=False)
-    except KeyboardInterrupt:
-        stop_processing()
-        logging.info("Server stopped by user")
+        with data_lock:
+            output = io.StringIO()
+            writer = csv.DictWriter(output, fieldnames=["timestamp", "readerIndex", "status", "companyName", "atr", "authentication", "presentTime"])
+            writer.writeheader()
+            for entry in history_data:
+                writer.writerow(entry)
+            output.seek(0)
+            return send_file(
+                io.BytesIO(output.getvalue().encode('utf-8')),
+                mimetype='text/csv',
+                as_attachment=True,
+                download_name='history.csv'
+            )
     except Exception as e:
-        logging.error(f"Server error: {e}")
+        logging.error(f"Error in download_history: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/login', methods=['POST'])
+def login():
+    try:
+        logging.debug(f"Received login request at {time.strftime('%H:%M:%S', time.localtime())} with headers: {dict(request.headers)} and body: {request.get_data()}")
+        data = request.get_json()
+
+        if data is None:
+            logging.error(f"Login failed at {time.strftime('%H:%M:%S', time.localtime())}: No JSON data received")
+            return jsonify({"status": "error", "message": "Request must be application/json"}), 415
+
+        username = data.get('username')
+        password = data.get('password')
+
+        # STATIC CREDENTIALS CHECK
+        if username == 'techvezoto' and password == 'techvezoto@1122':
+            if start_processing():
+                logging.info(f"Login successful at {time.strftime('%H:%M:%S', time.localtime())}, processing started")
+                return jsonify({"status": "success"})
+            else:
+                logging.error(f"Login failed at {time.strftime('%H:%M:%S', time.localtime())}: Processing failed to start")
+                return jsonify({"status": "error", "message": "Failed to start reader processing"}), 500
+
+        # Invalid credentials
+        logging.warning(f"Login failed at {time.strftime('%H:%M:%S', time.localtime())}: Invalid credentials")
+        return jsonify({"status": "error", "message": "Invalid username or password"}), 401
+
+    except Exception as e:
+        logging.error(f"Error in login at {time.strftime('%H:%M:%S', time.localtime())}: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    try:
         stop_processing()
+        logging.info(f"Logout successful at {time.strftime('%H:%M:%S', time.localtime())}, processing stopped")
+        return jsonify({"status": "success"})
+    except Exception as e:
+        logging.error(f"Error in logout at {time.strftime('%H:%M:%S', time.localtime())}: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/graphs.html')
+def graphs():
+    return render_template('graphs.html')
+
+@app.route('/logs.html')
+def logs():
+    return render_template('logs.html')
+
+@socketio.on('connect', namespace='/logs')
+def handle_connect():
+    logging.info(f"Client connected to /logs namespace at {time.strftime('%H:%M:%S', time.localtime())}")
+
+@socketio.on('disconnect', namespace='/logs')
+def handle_disconnect():
+    logging.info(f"Client disconnected from /logs namespace at {time.strftime('%H:%M:%S', time.localtime())}")
+
+if __name__ == "__main__":
+    gc.set_threshold(700, 10, 10)  # More frequent collections
+    socketio.run(app, debug=False, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)
