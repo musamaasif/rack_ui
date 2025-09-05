@@ -51,7 +51,7 @@ APDU_COMMANDS = [
     "00B0000008"       # Read second identifier part
 ]
 REQUEST_INTERVAL = 1
-NUM_CARDS = 16
+NUM_CARDS = 32
 SOCKET_RETRY_INTERVAL = 5  # Seconds between retry attempts
 SOCKET_RETRY_TIMEOUT = 60000  # Total retry duration in seconds
 READER_INDEX_MAPPING = {}
@@ -79,33 +79,20 @@ def format_duration(seconds):
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 def connect_reader(reader_index):
-    """Connect to a specific smart card reader by index, ARM safe."""
+    """Connect to a specific smart card reader by index."""
     try:
         reader_list = readers()
-        if not reader_list:
-            raise ValueError("No readers detected")
         mapped_index = READER_INDEX_MAPPING.get(reader_index, reader_index)
         if mapped_index >= len(reader_list):
             raise ValueError(f"No reader available for mapped index {mapped_index}")
         reader_name = reader_list[mapped_index].name
-        logging.info(f"Thread {reader_index}: Attempting to connect to reader: {reader_name}")
+        logging.info(f"Thread {reader_index}: Attempting to connect to reader: {reader_name} (system index {mapped_index}, mapped to reader {reader_index})")
         connection = reader_list[mapped_index].createConnection()
         observer = ConsoleCardConnectionObserver()
         connection.addObserver(observer)
-        # Sequential connect with timeout (ARM safe)
-        timeout_seconds = 5
-        start_time = time.time()
-        while time.time() - start_time < timeout_seconds:
-            try:
-                connection.connect()
-                break
-            except Exception:
-                time.sleep(0.1)
-        else:
-            logging.error(f"Thread {reader_index}: Timeout connecting to reader {reader_name}")
-            return None
+        connection.connect()
         atr = toHexString(connection.getATR())
-        logging.info(f"Thread {reader_index}: Connected to reader {reader_name} with ATR: {atr}")
+        logging.info(f"Thread {reader_index}: Connected to reader: {reader_name} (system index {mapped_index}, mapped to reader {reader_index}) with ATR: {atr}")
         return connection
     except Exception as e:
         logging.error(f"Thread {reader_index}: Reader connection error: {e}")
@@ -220,7 +207,7 @@ def fetch_apdu_from_server(sock, identifier, thread_id, response_data=None, stat
     return None
 
 history_data = []
-HISTORY_LIMIT = 1000
+HISTORY_LIMIT = 2000
 def process_card(reader_index):
     """Process a single card in a separate thread."""
     thread_id = reader_index
@@ -753,15 +740,12 @@ def start_processing():
             try:
                 system_readers = readers()
                 READER_INDEX_MAPPING = {i: i for i in range(min(NUM_CARDS, len(system_readers)))}
-                threads = []
-                for i in range(NUM_CARDS):
-                    t = threading.Thread(target=process_card, args=(i,))
-                    t.start()
-                    threads.append(t)
-                    time.sleep(0.05)  # small delay between threads to prevent ARM block
+                threads = [threading.Thread(target=process_card, args=(i,)) for i in range(NUM_CARDS)]
+                for thread in threads:
+                    thread.start()
                 logging.info(f"Started processing for all readers at {time.strftime('%H:%M:%S', time.localtime())}")
             except Exception as e:
-                logging.error(f"Failed to start processing: {e}")
+                logging.error(f"Failed to start processing at {time.strftime('%H:%M:%S', time.localtime())}: {e}")
                 is_running = False
                 threads = []
                 return False
