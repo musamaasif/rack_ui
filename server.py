@@ -1,6 +1,7 @@
 from flask import Flask, jsonify, render_template, request, send_file
 from flask_socketio import SocketIO
 import socket
+import sys
 import json, io, csv
 import time
 import threading
@@ -10,8 +11,34 @@ from smartcard.System import readers
 from smartcard.util import toHexString, toBytes
 from smartcard.CardConnectionObserver import ConsoleCardConnectionObserver
 
+# ----------------------------
+# TCP keepalive helper (prevents idle/NAT drops)
+# ----------------------------
+def set_tcp_keepalive(sock: socket.socket, *, idle=60, interval=15, count=4):
+    """
+    Enable TCP keepalives so NATs/routers don't drop idle connections.
+    Safe to call on any socket; Linux gets extra tunables.
+    """
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if sys.platform.startswith("linux"):
+            TCP_KEEPIDLE = getattr(socket, "TCP_KEEPIDLE", 4)
+            TCP_KEEPINTVL = getattr(socket, "TCP_KEEPINTVL", 5)
+            TCP_KEEPCNT = getattr(socket, "TCP_KEEPCNT", 6)
+            sock.setsockopt(socket.IPPROTO_TCP, TCP_KEEPIDLE, idle)
+            sock.setsockopt(socket.IPPROTO_TCP, TCP_KEEPINTVL, interval)
+            sock.setsockopt(socket.IPPROTO_TCP, TCP_KEEPCNT, count)
+    except Exception as e:
+        logging.warning(f"Keepalive setup failed: {e}")
+
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*")
+# Socket.IO stays the same, just add ping settings to keep the WS alive
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    ping_interval=20,   # send WS ping every 20s
+    ping_timeout=60     # allow up to 60s for pong
+)
 
 # Custom SocketIO Handler for emitting logs
 class SocketIOHandler(logging.Handler):
@@ -115,22 +142,26 @@ def create_socket(thread_id):
     while time.time() - start_time < SOCKET_RETRY_TIMEOUT:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5)
+            # keepalive BEFORE/AFTER connect (Linux tunables applied either way)
+            set_tcp_keepalive(sock, idle=60, interval=15, count=4)
+            sock.settimeout(5)  # connect + first recv deadline
             sock.connect((SERVER_IP, SERVER_PORT))
-            print(f"Thread {thread_id}: Connected to server {SERVER_IP}:{SERVER_PORT}")
+            # keepalive again (safe) after connect
+            set_tcp_keepalive(sock, idle=60, interval=15, count=4)
+            logging.info(f"Thread {thread_id}: Connected to server {SERVER_IP}:{SERVER_PORT} (TCP keepalive ON)")
             return sock
         except socket.error as e:
-            print(f"Thread {thread_id}: Socket connection error: {e}. Retrying in {SOCKET_RETRY_INTERVAL} seconds...")
+            logging.warning(f"Thread {thread_id}: Socket connection error: {e}. Retrying in {SOCKET_RETRY_INTERVAL} seconds...")
             time.sleep(SOCKET_RETRY_INTERVAL)
-    print(f"Thread {thread_id}: Failed to connect to server after {SOCKET_RETRY_TIMEOUT} seconds")
+    logging.error(f"Thread {thread_id}: Failed to connect to server after {SOCKET_RETRY_TIMEOUT} seconds")
     return None
 
 def send_receive(sock, payload, operation, thread_id):
     """Send a payload to the server and receive the response."""
     try:
         sock.sendall(payload)
-        logging.debug(f"Thread {thread_id}: Sent payload for {operation}: {payload.decode()}")
-        response = sock.recv(4096).decode().strip()
+        logging.debug(f"Thread {thread_id}: Sent payload for {operation}: {payload.decode(errors='ignore')}")
+        response = sock.recv(4096).decode(errors='ignore').strip()
         json_start = response.find('{')
         if json_start == -1:
             logging.error(f"Thread {thread_id}: No JSON found in {operation} response: {response}")
@@ -141,8 +172,14 @@ def send_receive(sock, payload, operation, thread_id):
         except json.JSONDecodeError as e:
             logging.error(f"Thread {thread_id}: JSON parsing error for {operation}: {e}, Response: {json_data}")
             return None
+    except (socket.timeout, TimeoutError) as e:
+        logging.warning(f"Thread {thread_id}: Socket timeout during {operation}: {e}")
+        return None
     except socket.error as e:
         logging.error(f"Thread {thread_id}: Socket error during {operation}: {e}")
+        return None
+    except Exception as e:
+        logging.error(f"Thread {thread_id}: Unexpected error during {operation}: {e}")
         return None
 
 def send_identifier(sock, identifier, thread_id, vehicle_schedule_id=None):
@@ -416,7 +453,10 @@ def process_card(reader_index):
             response_data = send_identifier(sock, combined_identifier, thread_id, vehicle_schedule_id)
             if not response_data:
                 logging.error(f"Thread {thread_id}: Failed to retrieve server response, attempting to reconnect")
-                sock.close()
+                try:
+                    sock.close()
+                except Exception:
+                    pass
                 sock = create_socket(thread_id)
                 if not sock:
                     with data_lock:
@@ -723,7 +763,10 @@ def process_card(reader_index):
         combined_identifier = None
     finally:
         if sock:
-            sock.close()
+            try:
+                sock.close()
+            except Exception:
+                pass
             logging.info(f"Thread {thread_id}: Socket closed")
         if connection:
             try:
@@ -878,4 +921,6 @@ def handle_disconnect():
     logging.info(f"Client disconnected from /logs namespace at {time.strftime('%H:%M:%S', time.localtime())}")
 
 if __name__ == "__main__":
+    # Run the Flask+Socket.IO UI; readers run after /login
     socketio.run(app, debug=False, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)
+
