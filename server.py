@@ -81,6 +81,10 @@ REQUEST_INTERVAL = 1
 SOCKET_RETRY_INTERVAL = 5
 SOCKET_RETRY_TIMEOUT = 60
 
+# Debounce / backoff tuning
+REMOVAL_GRACE_SEC = 3.0     # don't declare removal until > this since last good ATR
+MAX_CONNECT_BACKOFF = 10.0  # cap backoff between reader connect retries (seconds)
+
 # dynamic mapping filled at start
 READER_INDEX_MAPPING = {}
 
@@ -250,8 +254,10 @@ def process_card(reader_index):
     prev_auth_status = -1
     combined_identifier = None
 
-    # NEW: remember which ATR we already asked the company for (per reader)
-    last_company_lookup_atr = None
+    # NEW: backoff + presence state
+    connect_failures = 0
+    last_card_ok = 0.0
+    inserted_sent = False  # ensure we send inserted once per presence cycle
 
     try:
         while is_running:
@@ -270,8 +276,15 @@ def process_card(reader_index):
                             rd.update({"status": "Disconnected", "presentTime": "N/A",
                                        "cardInsertTime": None, "atr": "N/A", "companyName": "N/A",
                                        "authentication": "Unknown"})
-                    time.sleep(REQUEST_INTERVAL)
+                    # backoff after failed connect (T0/T1 unpowered, empty, etc.)
+                    delay = min(MAX_CONNECT_BACKOFF, max(1.0, 0.5 * (2 ** connect_failures)))
+                    connect_failures = min(connect_failures + 1, 6)
+                    logging.debug(f"Thread {thread_id}: connect backoff {delay:.1f}s after failure {connect_failures}")
+                    time.sleep(delay)
                     continue
+
+                # success → reset backoff
+                connect_failures = 0
 
                 # Read identifier parts
                 identifier_parts = []
@@ -295,8 +308,11 @@ def process_card(reader_index):
                             pass
                         connection = None
                         company_name = None
-                        time.sleep(REQUEST_INTERVAL)
-                        # keep worker alive
+                        # backoff next connect try
+                        delay = min(MAX_CONNECT_BACKOFF, max(1.0, 0.5 * (2 ** connect_failures)))
+                        connect_failures = min(connect_failures + 1, 6)
+                        logging.debug(f"Thread {thread_id}: connect backoff {delay:.1f}s after APDU select failure")
+                        time.sleep(delay)
                         continue
                     if i in [1, 3]:
                         identifier_parts.append(data)
@@ -319,13 +335,16 @@ def process_card(reader_index):
                         pass
                     connection = None
                     company_name = None
-                    time.sleep(REQUEST_INTERVAL)
+                    # backoff next connect try
+                    delay = min(MAX_CONNECT_BACKOFF, max(1.0, 0.5 * (2 ** connect_failures)))
+                    connect_failures = min(connect_failures + 1, 6)
+                    logging.debug(f"Thread {thread_id}: connect backoff {delay:.1f}s after identifier failure")
+                    time.sleep(delay)
                     continue
 
                 combined_identifier = "".join(identifier_parts)
-                # new ATR -> force next company lookup
-                last_company_lookup_atr = None
-
+                last_card_ok = time.time()   # first successful access
+                inserted_sent = False        # will send inserted below
                 with data_lock:
                     _append_history({
                         "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
@@ -357,11 +376,17 @@ def process_card(reader_index):
                         pass
                     connection = None
                     company_name = None
-                    time.sleep(REQUEST_INTERVAL)
+                    # backoff next connect try
+                    delay = min(MAX_CONNECT_BACKOFF, max(1.0, 0.5 * (2 ** connect_failures)))
+                    connect_failures = min(connect_failures + 1, 6)
+                    logging.debug(f"Thread {thread_id}: connect backoff {delay:.1f}s after socket failure")
+                    time.sleep(delay)
                     continue
 
-                # Send card inserted status (non-fatal on failure)
-                send_card_status(sock, combined_identifier, thread_id, "inserted", vehicle_schedule_id)
+                # Send card inserted once per cycle
+                if not inserted_sent:
+                    send_card_status(sock, combined_identifier, thread_id, "inserted", vehicle_schedule_id)
+                    inserted_sent = True
 
             # Update presentTime
             with data_lock:
@@ -377,38 +402,45 @@ def process_card(reader_index):
                 elif rd:
                     rd["presentTime"] = "N/A"
 
-            # Ensure card still present
+            # Ensure card still present (debounced)
             try:
                 connection.getATR()
+                last_card_ok = time.time()
             except Exception as e:
-                logging.error(f"Thread {thread_id}: getATR failed (card removed?): {e}")
-                if sock and combined_identifier:
-                    send_card_status(sock, combined_identifier, thread_id, "removed", vehicle_schedule_id)
-                with data_lock:
-                    _append_history({
-                        "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
-                        "readerIndex": reader_index, "status": "Card Removed",
-                        "companyName": "N/A", "atr": "N/A", "authentication": "Unknown", "presentTime": "N/A"
-                    })
-                    rd = reader_data.get(thread_id)
-                    if rd:
-                        rd.update({"status": "Card Removed", "presentTime": "N/A",
-                                   "cardInsertTime": None, "atr": "N/A",
-                                   "authentication": "Unknown", "companyName": "N/A"})
-                try:
-                    connection.disconnect()
-                except Exception:
-                    pass
-                connection = None
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-                sock = None
-                company_name = None
-                combined_identifier = None
-                vehicle_schedule_id = None
-                last_company_lookup_atr = None
+                # Only declare removal if we've had no successful ATR for > grace period
+                if (time.time() - last_card_ok) >= REMOVAL_GRACE_SEC:
+                    logging.error(f"Thread {thread_id}: getATR failed (card removed?): {e}")
+                    if sock and combined_identifier and inserted_sent:
+                        send_card_status(sock, combined_identifier, thread_id, "removed", vehicle_schedule_id)
+                    with data_lock:
+                        _append_history({
+                            "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
+                            "readerIndex": reader_index, "status": "Card Removed",
+                            "companyName": "N/A", "atr": "N/A", "authentication": "Unknown", "presentTime": "N/A"
+                        })
+                        rd = reader_data.get(thread_id)
+                        if rd:
+                            rd.update({"status": "Card Removed", "presentTime": "N/A",
+                                       "cardInsertTime": None, "atr": "N/A",
+                                       "authentication": "Unknown", "companyName": "N/A"})
+                    try:
+                        connection.disconnect()
+                    except Exception:
+                        pass
+                    connection = None
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                    sock = None
+                    company_name = None
+                    combined_identifier = None
+                    vehicle_schedule_id = None
+                    inserted_sent = False
+                    connect_failures = 0  # reset; next connect shouldn’t be delayed
+                else:
+                    # transient blip; don't mark removed, just wait a bit
+                    logging.debug(f"Thread {thread_id}: transient ATR error within grace; not removing yet")
                 time.sleep(REQUEST_INTERVAL)
                 continue
 
@@ -439,7 +471,8 @@ def process_card(reader_index):
                     connection = None
                     company_name = None
                     combined_identifier = None
-                    last_company_lookup_atr = None
+                    inserted_sent = False
+                    # small delay before trying again
                     time.sleep(REQUEST_INTERVAL)
                     continue
                 time.sleep(REQUEST_INTERVAL)
@@ -466,7 +499,8 @@ def process_card(reader_index):
                     })
 
             if auth_status == 1:
-                logging.info(f"Thread {thread_id}: Authentication required")
+                if auth_status != prev_auth_status:
+                    logging.info(f"Thread {thread_id}: Authentication required")
                 with data_lock:
                     rd = reader_data.get(thread_id)
                     if rd:
@@ -488,8 +522,6 @@ def process_card(reader_index):
                 while apdu and apdu != "00000000000000":
                     if apdu == "11111111111111":
                         logging.debug(f"Thread {thread_id}: Skipping APDU {apdu}")
-                        # throttle to avoid busy spinning on placeholder APDU
-                        time.sleep(0.5)
                         data_apdu = fetch_apdu_from_server(sock, combined_identifier, thread_id, vehicle_schedule_id=vehicle_schedule_id)
                         if not data_apdu:
                             break
@@ -517,6 +549,7 @@ def process_card(reader_index):
                         connection = None
                         company_name = None
                         combined_identifier = None
+                        inserted_sent = False
                         # Recover; do not kill thread
                         break
 
@@ -548,6 +581,7 @@ def process_card(reader_index):
                                 rd.update({"status": "Connected", "authentication": "No Authentication Required",
                                            "cardInsertTime": time.time(), "presentTime": format_duration(0),
                                            "companyName": "N/A"})
+                        # Optional: reconnect reader to reset state (existing behavior)
                         try:
                             connection.disconnect()
                         except Exception:
@@ -566,13 +600,16 @@ def process_card(reader_index):
                                                "cardInsertTime": None, "companyName": "N/A"})
                             company_name = None
                             combined_identifier = None
-                            last_company_lookup_atr = None
+                            inserted_sent = False
                             # Recover loop
                             continue
                         has_reconnected = True
+                        last_card_ok = time.time()
+                        # Do NOT send removed here; the card is still present
 
             elif auth_status == 0:
-                logging.info(f"Thread {thread_id}: No authentication required")
+                if auth_status != prev_auth_status:
+                    logging.info(f"Thread {thread_id}: No authentication required")
                 with data_lock:
                     rd = reader_data.get(thread_id)
                     if rd:
@@ -586,21 +623,18 @@ def process_card(reader_index):
                             "companyName": rd["companyName"], "atr": rd["atr"],
                             "authentication": rd["authentication"], "presentTime": rd["presentTime"]
                         })
-                # ---- NEW: fetch company name only once per ATR ----
-                if combined_identifier and last_company_lookup_atr != combined_identifier:
-                    company_name = fetch_company_name(sock, combined_identifier, thread_id, vehicle_schedule_id)
-                    with data_lock:
-                        rd = reader_data.get(thread_id)
-                        if rd:
-                            rd["companyName"] = company_name if company_name else "N/A"
-                            _append_history({
-                                "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
-                                "readerIndex": reader_index, "status": rd["status"],
-                                "companyName": rd["companyName"], "atr": rd["atr"],
-                                "authentication": rd["authentication"], "presentTime": rd["presentTime"]
-                            })
-                    last_company_lookup_atr = combined_identifier
-                # ---------------------------------------------------
+                # company lookup (optional, not critical)
+                company_name = fetch_company_name(sock, combined_identifier, thread_id, vehicle_schedule_id)
+                with data_lock:
+                    rd = reader_data.get(thread_id)
+                    if rd:
+                        rd["companyName"] = company_name if company_name else "N/A"
+                        _append_history({
+                            "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
+                            "readerIndex": reader_index, "status": rd["status"],
+                            "companyName": rd["companyName"], "atr": rd["atr"],
+                            "authentication": rd["authentication"], "presentTime": rd["presentTime"]
+                        })
                 has_reconnected = False
 
             elif auth_status > 1 and not has_reconnected and prev_auth_status <= 1:
@@ -635,10 +669,16 @@ def process_card(reader_index):
                                        "cardInsertTime": None, "companyName": "N/A"})
                     company_name = None
                     combined_identifier = None
-                    last_company_lookup_atr = None
-                    time.sleep(REQUEST_INTERVAL)
+                    inserted_sent = False
+                    # backoff
+                    delay = min(MAX_CONNECT_BACKOFF, max(1.0, 0.5 * (2 ** connect_failures)))
+                    connect_failures = min(connect_failures + 1, 6)
+                    logging.debug(f"Thread {thread_id}: connect backoff {delay:.1f}s after reconnect failure")
+                    time.sleep(delay)
                     continue
                 has_reconnected = True
+                last_card_ok = time.time()
+                # Do NOT send removed here
 
             elif auth_status > 1 and has_reconnected:
                 logging.debug(f"Thread {thread_id}: Auth {auth_status}>1, already reconnected")
