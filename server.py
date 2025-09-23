@@ -250,6 +250,9 @@ def process_card(reader_index):
     prev_auth_status = -1
     combined_identifier = None
 
+    # NEW: remember which ATR we already asked the company for (per reader)
+    last_company_lookup_atr = None
+
     try:
         while is_running:
             # Ensure connection to reader
@@ -320,6 +323,9 @@ def process_card(reader_index):
                     continue
 
                 combined_identifier = "".join(identifier_parts)
+                # new ATR -> force next company lookup
+                last_company_lookup_atr = None
+
                 with data_lock:
                     _append_history({
                         "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
@@ -402,6 +408,7 @@ def process_card(reader_index):
                 company_name = None
                 combined_identifier = None
                 vehicle_schedule_id = None
+                last_company_lookup_atr = None
                 time.sleep(REQUEST_INTERVAL)
                 continue
 
@@ -432,6 +439,7 @@ def process_card(reader_index):
                     connection = None
                     company_name = None
                     combined_identifier = None
+                    last_company_lookup_atr = None
                     time.sleep(REQUEST_INTERVAL)
                     continue
                 time.sleep(REQUEST_INTERVAL)
@@ -480,6 +488,8 @@ def process_card(reader_index):
                 while apdu and apdu != "00000000000000":
                     if apdu == "11111111111111":
                         logging.debug(f"Thread {thread_id}: Skipping APDU {apdu}")
+                        # throttle to avoid busy spinning on placeholder APDU
+                        time.sleep(0.5)
                         data_apdu = fetch_apdu_from_server(sock, combined_identifier, thread_id, vehicle_schedule_id=vehicle_schedule_id)
                         if not data_apdu:
                             break
@@ -556,6 +566,7 @@ def process_card(reader_index):
                                                "cardInsertTime": None, "companyName": "N/A"})
                             company_name = None
                             combined_identifier = None
+                            last_company_lookup_atr = None
                             # Recover loop
                             continue
                         has_reconnected = True
@@ -575,17 +586,21 @@ def process_card(reader_index):
                             "companyName": rd["companyName"], "atr": rd["atr"],
                             "authentication": rd["authentication"], "presentTime": rd["presentTime"]
                         })
-                company_name = fetch_company_name(sock, combined_identifier, thread_id, vehicle_schedule_id)
-                with data_lock:
-                    rd = reader_data.get(thread_id)
-                    if rd:
-                        rd["companyName"] = company_name if company_name else "N/A"
-                        _append_history({
-                            "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
-                            "readerIndex": reader_index, "status": rd["status"],
-                            "companyName": rd["companyName"], "atr": rd["atr"],
-                            "authentication": rd["authentication"], "presentTime": rd["presentTime"]
-                        })
+                # ---- NEW: fetch company name only once per ATR ----
+                if combined_identifier and last_company_lookup_atr != combined_identifier:
+                    company_name = fetch_company_name(sock, combined_identifier, thread_id, vehicle_schedule_id)
+                    with data_lock:
+                        rd = reader_data.get(thread_id)
+                        if rd:
+                            rd["companyName"] = company_name if company_name else "N/A"
+                            _append_history({
+                                "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
+                                "readerIndex": reader_index, "status": rd["status"],
+                                "companyName": rd["companyName"], "atr": rd["atr"],
+                                "authentication": rd["authentication"], "presentTime": rd["presentTime"]
+                            })
+                    last_company_lookup_atr = combined_identifier
+                # ---------------------------------------------------
                 has_reconnected = False
 
             elif auth_status > 1 and not has_reconnected and prev_auth_status <= 1:
@@ -620,6 +635,7 @@ def process_card(reader_index):
                                        "cardInsertTime": None, "companyName": "N/A"})
                     company_name = None
                     combined_identifier = None
+                    last_company_lookup_atr = None
                     time.sleep(REQUEST_INTERVAL)
                     continue
                 has_reconnected = True
