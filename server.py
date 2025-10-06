@@ -10,8 +10,9 @@ from logging.handlers import RotatingFileHandler
 from smartcard.System import readers
 from smartcard.util import toHexString, toBytes
 from smartcard.CardConnectionObserver import ConsoleCardConnectionObserver
+import os
 
-# TCP keep alive helper (prevents idle/NAT drops)
+# TCP keep alive
 def set_tcp_keepalive(sock: socket.socket, *, idle=60, interval=15, count=4):
     """
     Enable TCP keepalives so NATs/routers don't drop idle connections.
@@ -30,12 +31,12 @@ def set_tcp_keepalive(sock: socket.socket, *, idle=60, interval=15, count=4):
         logging.warning(f"Keepalive setup failed: {e}")
 
 app = Flask(__name__)
-# Socket.IO with ping settings to keep WS alive
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    ping_interval=20,   # send WS ping every 20s
-    ping_timeout=60     # allow up to 60s for pong
+    ping_interval=20,
+    ping_timeout=60,
+    async_mode="threading"
 )
 
 # Custom SocketIO Handler for emitting logs
@@ -68,27 +69,27 @@ logging.getLogger('').addHandler(socketio_handler)
 # Configuration
 SERVER_IP = "206.189.24.200"
 SERVER_PORT = 20119
-APP_ID = "r06"
+APP_ID = "r06"          # unique app id
+DEVICE_ID = "rack16"    # human-readable name
+WEB_PORT = 5000         # port Flask will listen on
+DEVICE_OFFSET = 0
 
 APDU_COMMANDS = [
-    "00A4020C020002",  # Select application 1
-    "00B0000118",      # Read first identifier part
-    "00A4020C020005",  # Select application 2
-    "00B0000008"       # Read second identifier part
+    "00A4020C020002",
+    "00B0000118",
+    "00A4020C020005",
+    "00B0000008"
 ]
+
+def reader_no(idx: int) -> int:
+    return DEVICE_OFFSET + idx + 1
 
 REQUEST_INTERVAL = 1
 SOCKET_RETRY_INTERVAL = 5
 SOCKET_RETRY_TIMEOUT = 60
-
-# Debounce / backoff tuning
-REMOVAL_GRACE_SEC = 3.0     # don't declare removal until > this since last good ATR
-MAX_CONNECT_BACKOFF = 10.0  # cap backoff between reader connect retries (seconds)
-
-# dynamic mapping filled at start
+REMOVAL_GRACE_SEC = 3.0
+MAX_CONNECT_BACKOFF = 10.0
 READER_INDEX_MAPPING = {}
-
-# Shared reader data (allocated when we know the count)
 reader_data = {}
 is_running = False
 threads = []
@@ -179,14 +180,14 @@ def send_receive(sock, payload, operation, thread_id):
         return None
 
 def send_identifier(sock, identifier, thread_id, vehicle_schedule_id=None):
-    payload_data = {"atr": identifier, "app_id": APP_ID, "reader_no": thread_id + 1}
+    payload_data = {"atr": identifier, "app_id": APP_ID, "device_id": DEVICE_ID, "reader_no": reader_no(thread_id)}
     if vehicle_schedule_id is not None:
         payload_data["vehicle_schedule_id"] = vehicle_schedule_id
     payload = json.dumps({"type": "atr", "data": payload_data}).encode()
     return send_receive(sock, payload, "send_identifier", thread_id)
 
 def fetch_company_name(sock, identifier, thread_id, vehicle_schedule_id=None):
-    payload_data = {"atr": identifier, "reader_no": thread_id + 1, "app_id": APP_ID}
+    payload_data = {"atr": identifier, "app_id": APP_ID, "device_id": DEVICE_ID, "reader_no": reader_no(thread_id)}
     if vehicle_schedule_id is not None:
         payload_data["vehicle_schedule_id"] = vehicle_schedule_id
     payload = json.dumps({"type": "get_company_card", "data": payload_data}).encode()
@@ -202,7 +203,7 @@ def fetch_company_name(sock, identifier, thread_id, vehicle_schedule_id=None):
     return None
 
 def send_card_status(sock, identifier, thread_id, status, vehicle_schedule_id=None):
-    payload_data = {"atr": identifier, "reader_no": thread_id + 1, "app_id": APP_ID}
+    payload_data = {"atr": identifier, "reader_no": reader_no(thread_id), "app_id": APP_ID, "device_id": DEVICE_ID}
     if vehicle_schedule_id is not None:
         payload_data["vehicle_schedule_id"] = vehicle_schedule_id
     payload = json.dumps({"type": f"card_{status}", "data": payload_data}).encode()
@@ -214,7 +215,7 @@ def send_card_status(sock, identifier, thread_id, status, vehicle_schedule_id=No
     return response_data
 
 def fetch_apdu_from_server(sock, identifier, thread_id, response_data=None, status=None, pre_apdu=None, vehicle_schedule_id=None):
-    payload_data = {"atr": identifier, "app_id": APP_ID, "reader_no": thread_id + 1}
+    payload_data = {"atr": identifier, "app_id": APP_ID, "device_id": DEVICE_ID, "reader_no": reader_no(thread_id)}
     if status is not None and response_data is not None:
         payload_data["response"] = response_data + status
         payload_data["apdu"] = pre_apdu
@@ -253,11 +254,9 @@ def process_card(reader_index):
     has_reconnected = False
     prev_auth_status = -1
     combined_identifier = None
-
-    # NEW: backoff + presence state
     connect_failures = 0
     last_card_ok = 0.0
-    inserted_sent = False  # ensure we send inserted once per presence cycle
+    inserted_sent = False
 
     try:
         while is_running:
@@ -283,7 +282,6 @@ def process_card(reader_index):
                     time.sleep(delay)
                     continue
 
-                # success → reset backoff
                 connect_failures = 0
 
                 # Read identifier parts
@@ -376,7 +374,6 @@ def process_card(reader_index):
                         pass
                     connection = None
                     company_name = None
-                    # backoff next connect try
                     delay = min(MAX_CONNECT_BACKOFF, max(1.0, 0.5 * (2 ** connect_failures)))
                     connect_failures = min(connect_failures + 1, 6)
                     logging.debug(f"Thread {thread_id}: connect backoff {delay:.1f}s after socket failure")
@@ -388,7 +385,7 @@ def process_card(reader_index):
                     send_card_status(sock, combined_identifier, thread_id, "inserted", vehicle_schedule_id)
                     inserted_sent = True
 
-            # Update presentTime
+            # Update present time
             with data_lock:
                 rd = reader_data.get(thread_id)
                 if rd and rd.get("cardInsertTime"):
@@ -402,7 +399,6 @@ def process_card(reader_index):
                 elif rd:
                     rd["presentTime"] = "N/A"
 
-            # Ensure card still present (debounced)
             try:
                 connection.getATR()
                 last_card_ok = time.time()
@@ -581,7 +577,6 @@ def process_card(reader_index):
                                 rd.update({"status": "Connected", "authentication": "No Authentication Required",
                                            "cardInsertTime": time.time(), "presentTime": format_duration(0),
                                            "companyName": "N/A"})
-                        # Optional: reconnect reader to reset state (existing behavior)
                         try:
                             connection.disconnect()
                         except Exception:
@@ -623,7 +618,6 @@ def process_card(reader_index):
                             "companyName": rd["companyName"], "atr": rd["atr"],
                             "authentication": rd["authentication"], "presentTime": rd["presentTime"]
                         })
-                # company lookup (optional, not critical)
                 company_name = fetch_company_name(sock, combined_identifier, thread_id, vehicle_schedule_id)
                 with data_lock:
                     rd = reader_data.get(thread_id)
@@ -670,7 +664,6 @@ def process_card(reader_index):
                     company_name = None
                     combined_identifier = None
                     inserted_sent = False
-                    # backoff
                     delay = min(MAX_CONNECT_BACKOFF, max(1.0, 0.5 * (2 ** connect_failures)))
                     connect_failures = min(connect_failures + 1, 6)
                     logging.debug(f"Thread {thread_id}: connect backoff {delay:.1f}s after reconnect failure")
@@ -678,7 +671,6 @@ def process_card(reader_index):
                     continue
                 has_reconnected = True
                 last_card_ok = time.time()
-                # Do NOT send removed here
 
             elif auth_status > 1 and has_reconnected:
                 logging.debug(f"Thread {thread_id}: Auth {auth_status}>1, already reconnected")
@@ -940,6 +932,6 @@ def handle_disconnect():
     logging.info(f"Client disconnected from /logs at {time.strftime('%H:%M:%S', time.localtime())}")
 
 if __name__ == "__main__":
-    # Run the Flask+Socket.IO UI; workers start after /login
-    socketio.run(app, debug=False, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)
+    socketio.run(app, debug=False, host='0.0.0.0', port=WEB_PORT, allow_unsafe_werkzeug=True)
+
 
