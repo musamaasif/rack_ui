@@ -14,10 +14,6 @@ import os
 
 # TCP keep alive
 def set_tcp_keepalive(sock: socket.socket, *, idle=60, interval=15, count=4):
-    """
-    Enable TCP keepalives so NATs/routers don't drop idle connections.
-    Safe to call on any socket; Linux gets extra tunables.
-    """
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         if sys.platform.startswith("linux"):
@@ -39,7 +35,6 @@ socketio = SocketIO(
     async_mode="threading"
 )
 
-# Custom SocketIO Handler for emitting logs
 class SocketIOHandler(logging.Handler):
     def emit(self, record):
         try:
@@ -48,30 +43,23 @@ class SocketIOHandler(logging.Handler):
         except Exception as e:
             print(f"SocketIOHandler error: {e}")
 
-# Configure root logger
 logging.getLogger('').setLevel(logging.DEBUG)
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-
-# Console handler
 console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.DEBUG)
 console_handler.setFormatter(formatter)
-
-# SocketIO handler
 socketio_handler = SocketIOHandler()
 socketio_handler.setLevel(logging.DEBUG)
 socketio_handler.setFormatter(formatter)
-
-# Add handlers
 logging.getLogger('').addHandler(console_handler)
 logging.getLogger('').addHandler(socketio_handler)
 
-# Configuration
+# Config
 SERVER_IP = "206.189.24.200"
 SERVER_PORT = 20119
-APP_ID = "r06"          # unique app id
-DEVICE_ID = "rack16"    # human-readable name
-WEB_PORT = 5000         # port Flask will listen on
+APP_ID = "r06"
+DEVICE_ID = "rack16"
+WEB_PORT = 5000
 DEVICE_OFFSET = 0
 
 APDU_COMMANDS = [
@@ -105,7 +93,6 @@ def format_duration(seconds):
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 def connect_reader(reader_index):
-    """Connect to a specific smart card reader by index."""
     try:
         reader_list = readers()
         mapped_index = READER_INDEX_MAPPING.get(reader_index, reader_index)
@@ -125,7 +112,6 @@ def connect_reader(reader_index):
         return None
 
 def execute_apdu(connection, apdu, thread_id):
-    """Execute an APDU command and return response data and status."""
     try:
         data, sw1, sw2 = connection.transmit(toBytes(apdu))
         status = f"{sw1:02X}{sw2:02X}"
@@ -136,7 +122,6 @@ def execute_apdu(connection, apdu, thread_id):
         return None, None
 
 def create_socket(thread_id):
-    """Create and connect a TCP socket to the server with retries."""
     start_time = time.time()
     while time.time() - start_time < SOCKET_RETRY_TIMEOUT and is_running:
         try:
@@ -154,7 +139,6 @@ def create_socket(thread_id):
     return None
 
 def send_receive(sock, payload, operation, thread_id):
-    """Send a payload to the server and receive the response (JSON)."""
     try:
         sock.sendall(payload)
         logging.debug(f"Thread {thread_id}: Sent {operation}: {payload.decode(errors='ignore')}")
@@ -185,6 +169,19 @@ def send_identifier(sock, identifier, thread_id, vehicle_schedule_id=None):
         payload_data["vehicle_schedule_id"] = vehicle_schedule_id
     payload = json.dumps({"type": "atr", "data": payload_data}).encode()
     return send_receive(sock, payload, "send_identifier", thread_id)
+
+def get_current_auth_status(sock, identifier, thread_id, vehicle_schedule_id=None):
+    try:
+        resp = send_identifier(sock, identifier, thread_id, vehicle_schedule_id)
+        if not resp:
+            return None
+        data = resp.get("data", {})
+        if isinstance(data, dict):
+            return data.get(identifier.lower(), None)
+        return None
+    except Exception as e:
+        logging.error(f"Thread {thread_id}: Error polling auth status - {e}")
+        return None
 
 def fetch_company_name(sock, identifier, thread_id, vehicle_schedule_id=None):
     payload_data = {"atr": identifier, "app_id": APP_ID, "device_id": DEVICE_ID, "reader_no": reader_no(thread_id)}
@@ -245,7 +242,6 @@ def _append_history(entry):
         history_data.pop(0)
 
 def process_card(reader_index):
-    """Process a single card in a separate thread; auto-recovers on errors."""
     thread_id = reader_index
     connection = None
     sock = None
@@ -260,7 +256,6 @@ def process_card(reader_index):
 
     try:
         while is_running:
-            # Ensure connection to reader
             if not connection:
                 connection = connect_reader(reader_index)
                 if not connection:
@@ -275,7 +270,6 @@ def process_card(reader_index):
                             rd.update({"status": "Disconnected", "presentTime": "N/A",
                                        "cardInsertTime": None, "atr": "N/A", "companyName": "N/A",
                                        "authentication": "Unknown"})
-                    # backoff after failed connect (T0/T1 unpowered, empty, etc.)
                     delay = min(MAX_CONNECT_BACKOFF, max(1.0, 0.5 * (2 ** connect_failures)))
                     connect_failures = min(connect_failures + 1, 6)
                     logging.debug(f"Thread {thread_id}: connect backoff {delay:.1f}s after failure {connect_failures}")
@@ -284,7 +278,6 @@ def process_card(reader_index):
 
                 connect_failures = 0
 
-                # Read identifier parts
                 identifier_parts = []
                 for i, apdu in enumerate(APDU_COMMANDS):
                     data, status = execute_apdu(connection, apdu, thread_id)
@@ -306,7 +299,6 @@ def process_card(reader_index):
                             pass
                         connection = None
                         company_name = None
-                        # backoff next connect try
                         delay = min(MAX_CONNECT_BACKOFF, max(1.0, 0.5 * (2 ** connect_failures)))
                         connect_failures = min(connect_failures + 1, 6)
                         logging.debug(f"Thread {thread_id}: connect backoff {delay:.1f}s after APDU select failure")
@@ -333,7 +325,6 @@ def process_card(reader_index):
                         pass
                     connection = None
                     company_name = None
-                    # backoff next connect try
                     delay = min(MAX_CONNECT_BACKOFF, max(1.0, 0.5 * (2 ** connect_failures)))
                     connect_failures = min(connect_failures + 1, 6)
                     logging.debug(f"Thread {thread_id}: connect backoff {delay:.1f}s after identifier failure")
@@ -341,8 +332,8 @@ def process_card(reader_index):
                     continue
 
                 combined_identifier = "".join(identifier_parts)
-                last_card_ok = time.time()   # first successful access
-                inserted_sent = False        # will send inserted below
+                last_card_ok = time.time()
+                inserted_sent = False
                 with data_lock:
                     _append_history({
                         "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
@@ -380,7 +371,6 @@ def process_card(reader_index):
                     time.sleep(delay)
                     continue
 
-                # Send card inserted once per cycle
                 if not inserted_sent:
                     send_card_status(sock, combined_identifier, thread_id, "inserted", vehicle_schedule_id)
                     inserted_sent = True
@@ -403,7 +393,6 @@ def process_card(reader_index):
                 connection.getATR()
                 last_card_ok = time.time()
             except Exception as e:
-                # Only declare removal if we've had no successful ATR for > grace period
                 if (time.time() - last_card_ok) >= REMOVAL_GRACE_SEC:
                     logging.error(f"Thread {thread_id}: getATR failed (card removed?): {e}")
                     if sock and combined_identifier and inserted_sent:
@@ -433,9 +422,8 @@ def process_card(reader_index):
                     combined_identifier = None
                     vehicle_schedule_id = None
                     inserted_sent = False
-                    connect_failures = 0  # reset; next connect shouldn’t be delayed
+                    connect_failures = 0
                 else:
-                    # transient blip; don't mark removed, just wait a bit
                     logging.debug(f"Thread {thread_id}: transient ATR error within grace; not removing yet")
                 time.sleep(REQUEST_INTERVAL)
                 continue
@@ -468,7 +456,6 @@ def process_card(reader_index):
                     company_name = None
                     combined_identifier = None
                     inserted_sent = False
-                    # small delay before trying again
                     time.sleep(REQUEST_INTERVAL)
                     continue
                 time.sleep(REQUEST_INTERVAL)
@@ -497,16 +484,23 @@ def process_card(reader_index):
             if auth_status == 1:
                 if auth_status != prev_auth_status:
                     logging.info(f"Thread {thread_id}: Authentication required")
+
+                # >>> SHOW COMPANY NAME DURING AUTH PHASE <<<
+                if company_name is None:
+                    company_name = fetch_company_name(sock, combined_identifier, thread_id, vehicle_schedule_id)
                 with data_lock:
                     rd = reader_data.get(thread_id)
                     if rd:
                         rd["status"] = "Connected"
+                        # keep showing real company (fallback N/A only if unknown)
+                        rd["companyName"] = company_name if company_name else rd.get("companyName", "N/A")
                         _append_history({
                             "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
                             "readerIndex": reader_index, "status": rd["status"],
                             "companyName": rd["companyName"], "atr": rd["atr"],
                             "authentication": rd["authentication"], "presentTime": rd["presentTime"]
                         })
+
                 data_apdu = fetch_apdu_from_server(sock, combined_identifier, thread_id, vehicle_schedule_id=vehicle_schedule_id)
                 if not data_apdu:
                     logging.error(f"Thread {thread_id}: Failed to fetch APDU")
@@ -516,6 +510,16 @@ def process_card(reader_index):
                 vehicle_schedule_id = data_apdu.get('vehicle_schedule_id', vehicle_schedule_id)
 
                 while apdu and apdu != "00000000000000":
+                    polled_status = get_current_auth_status(sock, combined_identifier, thread_id, vehicle_schedule_id)
+                    if polled_status == 0:
+                        logging.info(f"Thread {thread_id}: Auth status switched to 0 mid-auth → exiting APDU loop")
+                        # company_name already set; just refresh UI state
+                        with data_lock:
+                            rd = reader_data.get(thread_id)
+                            if rd:
+                                rd["companyName"] = company_name if company_name else rd.get("companyName", "N/A")
+                        break
+
                     if apdu == "11111111111111":
                         logging.debug(f"Thread {thread_id}: Skipping APDU {apdu}")
                         data_apdu = fetch_apdu_from_server(sock, combined_identifier, thread_id, vehicle_schedule_id=vehicle_schedule_id)
@@ -546,7 +550,6 @@ def process_card(reader_index):
                         company_name = None
                         combined_identifier = None
                         inserted_sent = False
-                        # Recover; do not kill thread
                         break
 
                     data_apdu = fetch_apdu_from_server(
@@ -565,18 +568,24 @@ def process_card(reader_index):
                         logging.error(f"Thread {thread_id}: Final APDU {apdu} failed")
                     else:
                         logging.info(f"Thread {thread_id}: Authentication complete")
+                        # ensure company name is set at end too
+                        if company_name is None:
+                            company_name = fetch_company_name(sock, combined_identifier, thread_id, vehicle_schedule_id)
                         with data_lock:
+                            real_company = company_name if company_name else "N/A"
                             _append_history({
                                 "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
                                 "readerIndex": reader_index, "status": "Connected",
-                                "companyName": "N/A", "atr": reader_data.get(thread_id, {}).get("atr", "N/A"),
-                                "authentication": "No Authentication Required", "presentTime": format_duration(0)
+                                "companyName": real_company,
+                                "atr": reader_data.get(thread_id, {}).get("atr", "N/A"),
+                                "authentication": "No Authentication Required",
+                                "presentTime": format_duration(0)
                             })
                             rd = reader_data.get(thread_id)
                             if rd:
                                 rd.update({"status": "Connected", "authentication": "No Authentication Required",
                                            "cardInsertTime": time.time(), "presentTime": format_duration(0),
-                                           "companyName": "N/A"})
+                                           "companyName": real_company})
                         try:
                             connection.disconnect()
                         except Exception:
@@ -596,11 +605,9 @@ def process_card(reader_index):
                             company_name = None
                             combined_identifier = None
                             inserted_sent = False
-                            # Recover loop
                             continue
                         has_reconnected = True
                         last_card_ok = time.time()
-                        # Do NOT send removed here; the card is still present
 
             elif auth_status == 0:
                 if auth_status != prev_auth_status:
@@ -618,11 +625,13 @@ def process_card(reader_index):
                             "companyName": rd["companyName"], "atr": rd["atr"],
                             "authentication": rd["authentication"], "presentTime": rd["presentTime"]
                         })
-                company_name = fetch_company_name(sock, combined_identifier, thread_id, vehicle_schedule_id)
+                # Keep/refresh company when status==0 as well
+                if company_name is None:
+                    company_name = fetch_company_name(sock, combined_identifier, thread_id, vehicle_schedule_id)
                 with data_lock:
                     rd = reader_data.get(thread_id)
                     if rd:
-                        rd["companyName"] = company_name if company_name else "N/A"
+                        rd["companyName"] = company_name if company_name else rd.get("companyName", "N/A")
                         _append_history({
                             "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
                             "readerIndex": reader_index, "status": rd["status"],
@@ -719,7 +728,6 @@ def process_card(reader_index):
                 logging.error(f"Thread {thread_id}: Error disconnecting reader: {e}")
 
 def supervise_threads():
-    """Restart any worker thread that dies (belt-and-suspenders)."""
     global threads
     while is_running:
         try:
@@ -774,14 +782,12 @@ def start_processing():
             _init_reader_data(count)
             threads = []
 
-        # Start worker threads (daemon)
         for i in range(count):
             t = threading.Thread(target=process_card, args=(i,), daemon=True)
             with data_lock:
                 threads.append(t)
             t.start()
 
-        # Start supervisor
         supervisor_thread = threading.Thread(target=supervise_threads, daemon=True)
         supervisor_thread.start()
 
@@ -797,14 +803,12 @@ def start_processing():
 
 def stop_processing():
     global is_running, threads
-    # Flip the flag without holding lock during join
     with data_lock:
         if not is_running:
             return
         is_running = False
         local_threads = list(threads)
 
-    # Join outside the lock to avoid deadlocks
     for t in local_threads:
         try:
             if t:
@@ -814,7 +818,6 @@ def stop_processing():
 
     with data_lock:
         threads = []
-        # Reset state
         for i in list(reader_data.keys()):
             reader_data[i] = {
                 "readerIndex": i,
@@ -827,7 +830,6 @@ def stop_processing():
             }
     logging.info(f"Stopped processing for all readers at {time.strftime('%H:%M:%S', time.localtime())}")
 
-# Flask routes
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -889,7 +891,6 @@ def login():
         username = data.get('username')
         password = data.get('password')
 
-        # Static credentials
         if username == 'techvezoto' and password == 'techvezoto@1122':
             if start_processing():
                 logging.info("Login successful; processing started")
@@ -933,5 +934,4 @@ def handle_disconnect():
 
 if __name__ == "__main__":
     socketio.run(app, debug=False, host='0.0.0.0', port=WEB_PORT, allow_unsafe_werkzeug=True)
-
 
