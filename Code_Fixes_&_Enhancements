@@ -1,0 +1,55 @@
+Card Rack System – Code Fixes & Enhancements Log
+Date: [07-10-2025]
+Author: M. Usama Asif
+
+Summary:
+This document tracks key bug fixes and structural improvements introduced to the Card Rack System codebase after stability testing. These updates focus on system reliability, resource management and network efficiency during long-term operation on OrangePi devices.
+
+Detailed Changes:
+1. Fixed 16-Hour Socket Timeout Bug
+Issue: SOCKET_RETRY_TIMEOUT was previously set to 60000 seconds (~16.7 hours), causing readers to hang indefinitely on network failure.
+Fix: Reduced to 60 seconds for realistic reconnection intervals.
+Impact: System now retries socket connections promptly after 1 minute instead of stalling for hours.
+
+2. Eliminated Silent Thread Death
+Issue: Worker threads previously terminated quietly when encountering certain error paths.
+Fix: All critical loops now safely recover instead of exiting.
+Added: A dedicated supervisor thread automatically restarts any failed reader thread.
+Impact: Ensures continuous operation without manual restarts or partial rack failure.
+
+3. Optimized Worker Thread Allocation
+Issue: Threads were pre-spawned for 16/32 slots regardless of connected readers.
+Fix: Threads are now spawned only for detected smart-card readers.
+Added: Threads are marked as daemons to allow graceful shutdown.
+Impact: Reduces CPU and memory overhead; improves scalability.
+
+4. Improved Safe Shutdown Handling
+Issue: stop_processing previously held a lock during join operations, risking lock-join deadlocks.
+Fix: The function now releases the lock before joining threads.
+Added: Automatic reader state reset after shutdown.
+Impact: Clean and deterministic shutdowns even under high thread count.
+
+5. Resiliency & Logging Enhancements
+Network Stability: TCP keepalive remains enabled across all socket connections, preventing long idle disconnects.
+Logging: Minor improvements for clarity and remote troubleshooting (standardized timestamps, reduced noise).
+Impact: Easier diagnosis and more stable long-running network communication.
+
+6. Reduced Unnecessary Network I/O
+Issue: get_company_card was called repeatedly in every loop iteration, flooding the remote API and consuming extra RAM.
+Fix: The system now fetches company name only once per ATR, or when the ATR changes.
+Impact: Drastically reduces redundant network traffic and memory usage.
+
+7. Controlled Dummy APDU Loop
+Issue: The “dummy” APDU sequence 11111111111111 looped too quickly, creating busy-spin behavior.
+Fix: Added a short sleep interval to throttle this loop.
+Impact: Prevents unnecessary CPU load while preserving correct functional behavior.
+
+8. Implemented Mid-Authentication Exit Logic
+Issue: During the APDU authentication sequence, if the remote server changed the authentication status to 0 mid-process, the system continued executing the remaining APDU commands indefinitely, causing potential infinite loops and unnecessary reader cycles.
+Fix: Introduced a get_current_auth_status() function and integrated a conditional exit check within the APDU loop. The authentication process now automatically terminates early when the server status switches to 0, allowing the reader to resume normal polling.
+Impact: Prevents infinite APDU loops, reduces authentication latency, and stabilizes reader-server synchronization, ensuring quicker recovery when authentication is canceled server-side.
+
+9. Implemented Persistent Company Name Display
+Issue: During and after authentication, the company name field intermittently reset to "N/A" until the final APDU completed. This caused inconsistent UI updates and confusion during live monitoring.
+Fix: Enhanced the server logic to maintain and reuse the last known valid company name throughout the authentication cycle. The company name is now fetched once per ATR and displayed continuously during authentication, then refreshed once more after successful completion.
+Impact: Provides a smoother and more informative user interface, company names remain visible at all stages while improving operator awareness and readability in the dashboard.
