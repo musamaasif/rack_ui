@@ -10,22 +10,22 @@ It supports:
 
 **Core Features**
 **Backend (server.py):**
-Built with Flask and Flask-SocketIO
-Manages multi-threaded smart card communication
-Sends APDU commands, handles ATR parsing, and maintains live connection with the server
+1. Built with Flask and Flask-SocketIO
+2. Manages multi-threaded smart card communication
+3. Sends APDU commands, handles ATR parsing, and maintains live connection with the server
 
 **Tracks:**
-Reader status (Connected, Disconnected, Card Removed)
-Authentication state (Authenticated, Failed, etc.)
-Company names linked to cards
-Card presence duration
-Logs every operation to both console and SocketIO feed in real-time
+1. Reader status (Connected, Disconnected, Card Removed)
+2. Authentication state (Authenticated, Failed, etc.)
+3. Company names linked to cards
+4. Card presence duration
+5. Logs every operation to both console and SocketIO feed in real-time
 
 **Includes:**
-/readers --- JSON endpoint for real-time data
-/history --- Returns log history
-/download_history --- CSV export of reader history
-/login and /logout --- Basic user authentication for dashboard access
+1. /readers --- JSON endpoint for real-time data
+2. /history --- Returns log history
+3. /download_history --- CSV export of reader history
+4. /login and /logout --- Basic user authentication for dashboard access
 
 **Frontend:**
 The UI includes three major pages:
