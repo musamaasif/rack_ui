@@ -1,4 +1,4 @@
-> **Overview**
+**Overview**
 This project implements a Smart Card Rack System using OrangePi as the main MPU. The system monitors multiple smart card readers, communicates with a remote authentication server and displays real-time card activity, authentication states, and company details via a web-based dashboard.
 
 It supports:
@@ -8,7 +8,7 @@ It supports:
 4. Historical tracking & CSV export
 5. Allow to download Trackers data after successful authentication
 
-> **Core Features**
+**Core Features**
 **Backend (server.py):**
 Built with Flask and Flask-SocketIO
 Manages multi-threaded smart card communication
