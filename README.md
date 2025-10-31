@@ -22,16 +22,16 @@ Card presence duration
 Logs every operation to both console and SocketIO feed in real-time
 
 **Includes:**
-/readers — JSON endpoint for real-time data
-/history — Returns log history (optionally per reader)
-/download_history — CSV export of reader history
-/login and /logout — Basic user authentication for dashboard access
+/readers --- JSON endpoint for real-time data
+/history --- Returns log history
+/download_history --- CSV export of reader history
+/login and /logout --- Basic user authentication for dashboard access
 
 **Frontend:**
 The UI includes three major pages:
-1. Dashboard(index.html)---Displays live reader data with login screen and dynamic updates every second.
-2. Graphs(graphs.html)---Visual analytics of reader status, authentication outcomes, and company distribution via Chart.js.
-3. Logs(logs.html)---Real-time log viewer using Socket.IO with filters by reader and date.
+1. Dashboard(index.html) --- Displays live reader data with login screen and dynamic updates every second.
+2. Graphs(graphs.html) --- Visual analytics of reader status, authentication outcomes, and company distribution via Chart.js.
+3. Logs(logs.html) --- Real-time log viewer using Socket.IO with filters by reader and date.
 
 **Developed For**
 TechVezoto — Smart Rack Management & Authentication Systems
