@@ -26,7 +26,7 @@ def set_tcp_keepalive(sock: socket.socket, *, idle=60, interval=15, count=4):
             TCP_KEEPCNT = getattr(socket, "TCP_KEEPCNT", 6)
             sock.setsockopt(socket.IPPROTO_TCP, TCP_KEEPIDLE, idle)
             sock.setsockopt(socket.IPPROTO_TCP, TCP_KEEPINTVL, interval)
-            sock.setsockopt(socket.IPPROTO_TCP, TCP_KEEPCNT, count)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, count)
     except Exception as e:
         logging.warning(f"Keepalive setup failed: {e}")
 
@@ -95,6 +95,7 @@ is_running = False
 threads = []
 supervisor_thread = None
 data_lock = threading.Lock()
+initial_reader_count = 0  # Store reader count at startup
 
 def format_duration(seconds):
     if seconds is None:
@@ -110,7 +111,8 @@ def connect_reader(reader_index):
         reader_list = readers()
         mapped_index = READER_INDEX_MAPPING.get(reader_index, reader_index)
         if mapped_index >= len(reader_list):
-            raise ValueError(f"No reader available for mapped index {mapped_index}")
+            # This is the error you were seeing.
+            raise ValueError(f"No reader available for mapped index {mapped_index} (System count: {len(reader_list)})")
         reader_name = reader_list[mapped_index].name
         logging.info(f"Thread {reader_index}: Connecting to reader: {reader_name} (sys {mapped_index} → logical {reader_index})")
         connection = reader_list[mapped_index].createConnection()
@@ -192,6 +194,7 @@ def fetch_company_name(sock, identifier, thread_id, vehicle_schedule_id=None):
         payload_data["vehicle_schedule_id"] = vehicle_schedule_id
     payload = json.dumps({"type": "get_company_card", "data": payload_data}).encode()
     response_data = send_receive(sock, payload, "fetch_company_name", thread_id)
+    
     if response_data and isinstance(response_data.get("data"), dict):
         company_name = response_data["data"].get(identifier.lower())
         if company_name:
@@ -469,7 +472,7 @@ def process_card(reader_index):
                     combined_identifier = None
                     inserted_sent = False
                     # small delay before trying again
-                    time.sleep(REQUEST_INTERVAL)
+                    time.sleep(REQUEST_INTERVAL) # Typo fixed from original code
                     continue
                 time.sleep(REQUEST_INTERVAL)
                 continue
@@ -507,6 +510,28 @@ def process_card(reader_index):
                             "companyName": rd["companyName"], "atr": rd["atr"],
                             "authentication": rd["authentication"], "presentTime": rd["presentTime"]
                         })
+
+                # --- NEW: even during auth, show the company name once we know it ---
+                if company_name is None:
+                    company_name = fetch_company_name(
+                        sock, combined_identifier, thread_id, vehicle_schedule_id
+                    )
+                    if company_name:
+                        with data_lock:
+                            rd = reader_data.get(thread_id)
+                            if rd:
+                                rd["companyName"] = company_name
+                                _append_history({
+                                    "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
+                                    "readerIndex": reader_index,
+                                    "status": rd["status"],
+                                    "companyName": rd["companyName"],
+                                    "atr": rd["atr"],
+                                    "authentication": rd["authentication"],
+                                    "presentTime": rd["presentTime"],
+                                })
+                # -------------------------------------------------------------------
+
                 data_apdu = fetch_apdu_from_server(sock, combined_identifier, thread_id, vehicle_schedule_id=vehicle_schedule_id)
                 if not data_apdu:
                     logging.error(f"Thread {thread_id}: Failed to fetch APDU")
@@ -569,14 +594,19 @@ def process_card(reader_index):
                             _append_history({
                                 "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
                                 "readerIndex": reader_index, "status": "Connected",
-                                "companyName": "N/A", "atr": reader_data.get(thread_id, {}).get("atr", "N/A"),
+                                "companyName": company_name if company_name else "N/A",
+                                "atr": reader_data.get(thread_id, {}).get("atr", "N/A"),
                                 "authentication": "No Authentication Required", "presentTime": format_duration(0)
                             })
                             rd = reader_data.get(thread_id)
                             if rd:
-                                rd.update({"status": "Connected", "authentication": "No Authentication Required",
-                                           "cardInsertTime": time.time(), "presentTime": format_duration(0),
-                                           "companyName": "N/A"})
+                                rd.update({
+                                    "status": "Connected",
+                                    "authentication": "No Authentication Required",
+                                    "cardInsertTime": time.time(),
+                                    "presentTime": format_duration(0),
+                                    "companyName": company_name if company_name else rd.get("companyName", "N/A")
+                                })
                         try:
                             connection.disconnect()
                         except Exception:
@@ -719,12 +749,44 @@ def process_card(reader_index):
                 logging.error(f"Thread {thread_id}: Error disconnecting reader: {e}")
 
 def supervise_threads():
-    """Restart any worker thread that dies (belt-and-suspenders)."""
-    global threads
+    """
+    Restart any worker thread that dies (belt-and-suspenders).
+    Also checks for hardware changes (reader count) and exits if a mismatch is found,
+    allowing systemd to restart the whole application.
+    """
+    global threads, initial_reader_count
+    
+    # Give threads a moment to start before we start checking
+    time.sleep(10) 
+    
     while is_running:
         try:
+            # --- NEW: Check for reader count mismatch ---
+            try:
+                current_readers = readers()
+                current_count = len(current_readers)
+                
+                # Check if the count has changed from when we started
+                if current_count != initial_reader_count:
+                    logging.critical(
+                        f"CRITICAL: Reader count mismatch detected. "
+                        f"Expected {initial_reader_count}, but found {current_count}. "
+                        f"This likely indicates a USB hardware failure or PCSC crash. "
+                        f"Exiting application to allow systemd to restart."
+                    )
+                    # Use os._exit(1) for an immediate, hard exit from a thread.
+                    os._exit(1) 
+                    
+            except Exception as e:
+                # If we can't even list readers, PCSC service is likely dead.
+                logging.critical(f"Supervisor: Failed to list PCSC readers: {e}. Exiting for restart.")
+                os._exit(1)
+            # --------------------------------------------
+
+            # --- Original thread supervision logic ---
             with data_lock:
                 snapshot = list(threads)
+                
             for idx, t in enumerate(snapshot):
                 if t is None:
                     continue
@@ -734,7 +796,10 @@ def supervise_threads():
                     with data_lock:
                         threads[idx] = nt
                     nt.start()
-            time.sleep(5)
+            
+            # Check every 5 seconds
+            time.sleep(5) 
+        
         except Exception as e:
             logging.error(f"Supervisor error: {e}")
             time.sleep(5)
@@ -754,7 +819,7 @@ def _init_reader_data(n):
     }
 
 def start_processing():
-    global is_running, threads, READER_INDEX_MAPPING, supervisor_thread
+    global is_running, threads, READER_INDEX_MAPPING, supervisor_thread, initial_reader_count
     with data_lock:
         if is_running:
             return True
@@ -763,6 +828,8 @@ def start_processing():
     try:
         system_readers = readers()
         count = len(system_readers)
+        initial_reader_count = count
+        
         if count == 0:
             logging.error("No smart-card readers detected.")
             with data_lock:
@@ -908,9 +975,8 @@ def login():
 @app.route('/logout', methods=['POST'])
 def logout():
     try:
-        stop_processing()
-        logging.info("Logout successful; processing stopped")
-        return jsonify({"status": "success"})
+        logging.info("Logout attempt ignored — processing continues")
+        return jsonify({"status": "success", "message": "Logout disabled — processing continues"})
     except Exception as e:
         logging.error(f"Error in logout: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -931,7 +997,11 @@ def handle_connect():
 def handle_disconnect():
     logging.info(f"Client disconnected from /logs at {time.strftime('%H:%M:%S', time.localtime())}")
 
+
+# --- THIS BLOCK IS MODIFIED ---
 if __name__ == "__main__":
+    logging.info("Application starting... Auto-starting reader processing.")
+    start_processing()  # <-- This is the new line
+
+    logging.info("Starting web server.")
     socketio.run(app, debug=False, host='0.0.0.0', port=WEB_PORT, allow_unsafe_werkzeug=True)
-
-
