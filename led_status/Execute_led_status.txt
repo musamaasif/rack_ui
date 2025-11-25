@@ -1,0 +1,36 @@
+
+cd rack_ui/
+nano led_status.py	#Paste code in led_status.py
+sudo chmod +x rack_ui/led_status.py
+
+______To Test whether it's working or not________
+
+sudo /usr/bin/python3 /home/orangepi/rack_ui/led_status.py
+
+______LED_status systemd service__________
+
+sudo tee /etc/systemd/system/led-status.service >/dev/null <<'EOF'
+[Unit]
+Description=Rack UI LED Status Manager
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/orangepi/rack_ui
+ExecStart=/usr/bin/python3 /home/orangepi/rack_ui/led_status.py
+Restart=always
+RestartSec=2
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+
+__________To start service_________
+sudo systemctl daemon-reload
+sudo systemctl enable led-status.service
+sudo systemctl start led-status.service
+
