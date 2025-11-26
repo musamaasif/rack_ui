@@ -6,18 +6,80 @@ import json, io, csv
 import time
 import threading
 import logging
+import glob
+import os
 from logging.handlers import RotatingFileHandler
 from smartcard.System import readers
 from smartcard.util import toHexString, toBytes
 from smartcard.CardConnectionObserver import ConsoleCardConnectionObserver
-import os
+
+# Card Readers Order
+MANUAL_SERIAL_ORDER = [
+    "35212024122496", # Slot 1
+    "35212024122398", # Slot 2
+    "35212024122401", # Slot 3
+    "35212024122425", # Slot 4
+    "35212024122383", # Slot 5
+    "35212024122476", # Slot 6
+    "35212024122464", # Slot 7
+    "35212024122447", # Slot 8
+    "35212024122411", # Slot 9
+    "35212024122390", # Slot 10
+    "35212024122441", # Slot 11
+    "35212024122501", # Slot 12
+    "35212024122419", # Slot 13
+    "35212024122373", # Slot 14
+    "35212024122420", # Slot 15  
+    "35212024122489"  # Slot 16
+]
+
+SORTED_READERS_CACHE = []
+
+def get_readers_mapped():
+    """
+    Returns readers sorted exactly according to MANUAL_SERIAL_ORDER.
+    """
+    try:
+        pcsc_list = readers()
+        if not pcsc_list: return []
+
+        # Create a map of Serial -> ReaderObject
+        available_readers = {}
+        for r in pcsc_list:
+            try:
+                r_name = str(r)
+                if "(" in r_name:
+                    serial = r_name.split("(")[1].split(")")[0]
+                    available_readers[serial] = r
+            except: pass
+
+        # Build the final list based on the Configured Order
+        final_list = []
+        
+        # 1. Fill slots based on Manual Config
+        for serial in MANUAL_SERIAL_ORDER:
+            if serial in available_readers:
+                final_list.append(available_readers[serial])
+                del available_readers[serial] # Remove so we don't add twice
+            else:
+                # If a configured reader is unplugged, we skip it
+                pass
+
+        # 2. Append any new/unknown readers at the end
+        for serial, r in available_readers.items():
+            final_list.append(r)
+
+        logging.info(f"[MAPPING] Sorted {len(final_list)} readers based on Manual Configuration.")
+        return final_list
+
+    except Exception as e:
+        logging.error(f"[MAPPING FAILED] {e}. Falling back to system order.")
+        return readers()
+
+# ==========================================
 
 # TCP keep alive
 def set_tcp_keepalive(sock: socket.socket, *, idle=60, interval=15, count=4):
-    """
-    Enable TCP keepalives so NATs/routers don't drop idle connections.
-    Safe to call on any socket; Linux gets extra tunables.
-    """
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         if sys.platform.startswith("linux"):
@@ -69,9 +131,9 @@ logging.getLogger('').addHandler(socketio_handler)
 # Configuration
 SERVER_IP = "206.189.24.200"
 SERVER_PORT = 20119
-APP_ID = "r06"          # unique app id
-DEVICE_ID = "rack16"    # human-readable name
-WEB_PORT = 5000         # port Flask will listen on
+APP_ID = "r06"
+DEVICE_ID = "rack16"
+WEB_PORT = 5000
 DEVICE_OFFSET = 0
 
 APDU_COMMANDS = [
@@ -95,7 +157,7 @@ is_running = False
 threads = []
 supervisor_thread = None
 data_lock = threading.Lock()
-initial_reader_count = 0  # Store reader count at startup
+initial_reader_count = 0
 
 def format_duration(seconds):
     if seconds is None:
@@ -108,13 +170,19 @@ def format_duration(seconds):
 def connect_reader(reader_index):
     """Connect to a specific smart card reader by index."""
     try:
-        reader_list = readers()
+        # --- REQUIRED CHANGE: Use Cached Sorted List ---
+        global SORTED_READERS_CACHE
+        if not SORTED_READERS_CACHE:
+            SORTED_READERS_CACHE = get_readers_mapped() # Uses Manual Map
+            
+        reader_list = SORTED_READERS_CACHE
+        # -----------------------------------------------
+
         mapped_index = READER_INDEX_MAPPING.get(reader_index, reader_index)
         if mapped_index >= len(reader_list):
-            # This is the error you were seeing.
             raise ValueError(f"No reader available for mapped index {mapped_index} (System count: {len(reader_list)})")
         reader_name = reader_list[mapped_index].name
-        logging.info(f"Thread {reader_index}: Connecting to reader: {reader_name} (sys {mapped_index} → logical {reader_index})")
+        logging.info(f"Thread {reader_index}: Connecting to reader: {reader_name} (sys {mapped_index} -> logical {reader_index})")
         connection = reader_list[mapped_index].createConnection()
         observer = ConsoleCardConnectionObserver()
         connection.addObserver(observer)
@@ -127,18 +195,16 @@ def connect_reader(reader_index):
         return None
 
 def execute_apdu(connection, apdu, thread_id):
-    """Execute an APDU command and return response data and status."""
     try:
         data, sw1, sw2 = connection.transmit(toBytes(apdu))
         status = f"{sw1:02X}{sw2:02X}"
-        logging.debug(f"Thread {thread_id}: APDU {apdu} → {toHexString(data)}, {status}")
+        logging.debug(f"Thread {thread_id}: APDU {apdu} -> {toHexString(data)}, {status}")
         return toHexString(data).replace(" ", ""), status
     except Exception as e:
         logging.error(f"Thread {thread_id}: APDU exec error for {apdu}: {e}")
         return None, None
 
 def create_socket(thread_id):
-    """Create and connect a TCP socket to the server with retries."""
     start_time = time.time()
     while time.time() - start_time < SOCKET_RETRY_TIMEOUT and is_running:
         try:
@@ -156,7 +222,6 @@ def create_socket(thread_id):
     return None
 
 def send_receive(sock, payload, operation, thread_id):
-    """Send a payload to the server and receive the response (JSON)."""
     try:
         sock.sendall(payload)
         logging.debug(f"Thread {thread_id}: Sent {operation}: {payload.decode(errors='ignore')}")
@@ -329,7 +394,7 @@ def process_card(reader_index):
                         rd = reader_data.get(thread_id)
                         if rd:
                             rd.update({"status": "Disconnected", "presentTime": "N/A",
-                                       "cardInsertTime": None, "companyName": "N/A"})
+                                         "cardInsertTime": None, "companyName": "N/A"})
                     try:
                         connection.disconnect()
                     except Exception:
@@ -472,7 +537,7 @@ def process_card(reader_index):
                     combined_identifier = None
                     inserted_sent = False
                     # small delay before trying again
-                    time.sleep(REQUEST_INTERVAL) # Typo fixed from original code
+                    time.sleep(REQUEST_INTERVAL) 
                     continue
                 time.sleep(REQUEST_INTERVAL)
                 continue
@@ -662,7 +727,7 @@ def process_card(reader_index):
                 has_reconnected = False
 
             elif auth_status > 1 and not has_reconnected and prev_auth_status <= 1:
-                logging.info(f"Thread {thread_id}: Auth status {auth_status}>1 → reconnect reader")
+                logging.info(f"Thread {thread_id}: Auth status {auth_status}>1 -> reconnect reader")
                 with data_lock:
                     _append_history({
                         "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
@@ -749,41 +814,24 @@ def process_card(reader_index):
                 logging.error(f"Thread {thread_id}: Error disconnecting reader: {e}")
 
 def supervise_threads():
-    """
-    Restart any worker thread that dies (belt-and-suspenders).
-    Also checks for hardware changes (reader count) and exits if a mismatch is found,
-    allowing systemd to restart the whole application.
-    """
     global threads, initial_reader_count
     
-    # Give threads a moment to start before we start checking
     time.sleep(10) 
     
     while is_running:
         try:
-            # --- NEW: Check for reader count mismatch ---
+            # --- REQUIRED CHANGE: Use Sorted Reader Check ---
             try:
-                current_readers = readers()
+                current_readers = get_readers_mapped() # Uses Manual Map
                 current_count = len(current_readers)
-                
-                # Check if the count has changed from when we started
                 if current_count != initial_reader_count:
-                    logging.critical(
-                        f"CRITICAL: Reader count mismatch detected. "
-                        f"Expected {initial_reader_count}, but found {current_count}. "
-                        f"This likely indicates a USB hardware failure or PCSC crash. "
-                        f"Exiting application to allow systemd to restart."
-                    )
-                    # Use os._exit(1) for an immediate, hard exit from a thread.
+                    logging.critical(f"CRITICAL: Reader count mismatch. Expected {initial_reader_count}, found {current_count}. Exiting.")
                     os._exit(1) 
-                    
             except Exception as e:
-                # If we can't even list readers, PCSC service is likely dead.
-                logging.critical(f"Supervisor: Failed to list PCSC readers: {e}. Exiting for restart.")
+                logging.critical(f"Supervisor: Failed to list PCSC readers: {e}. Exiting.")
                 os._exit(1)
             # --------------------------------------------
 
-            # --- Original thread supervision logic ---
             with data_lock:
                 snapshot = list(threads)
                 
@@ -797,7 +845,6 @@ def supervise_threads():
                         threads[idx] = nt
                     nt.start()
             
-            # Check every 5 seconds
             time.sleep(5) 
         
         except Exception as e:
@@ -820,13 +867,21 @@ def _init_reader_data(n):
 
 def start_processing():
     global is_running, threads, READER_INDEX_MAPPING, supervisor_thread, initial_reader_count
+    # --- REQUIRED CHANGE: GLOBAL CACHE ACCESS ---
+    global SORTED_READERS_CACHE
+    # --------------------------------------------
+    
     with data_lock:
         if is_running:
             return True
         is_running = True
 
     try:
-        system_readers = readers()
+        # --- REQUIRED CHANGE: SORT ONCE AND CACHE ---
+        system_readers = get_readers_mapped() # Uses Manual Map
+        SORTED_READERS_CACHE = system_readers
+        # --------------------------------------------
+        
         count = len(system_readers)
         initial_reader_count = count
         
@@ -841,14 +896,12 @@ def start_processing():
             _init_reader_data(count)
             threads = []
 
-        # Start worker threads (daemon)
         for i in range(count):
             t = threading.Thread(target=process_card, args=(i,), daemon=True)
             with data_lock:
                 threads.append(t)
             t.start()
 
-        # Start supervisor
         supervisor_thread = threading.Thread(target=supervise_threads, daemon=True)
         supervisor_thread.start()
 
@@ -864,14 +917,12 @@ def start_processing():
 
 def stop_processing():
     global is_running, threads
-    # Flip the flag without holding lock during join
     with data_lock:
         if not is_running:
             return
         is_running = False
         local_threads = list(threads)
 
-    # Join outside the lock to avoid deadlocks
     for t in local_threads:
         try:
             if t:
@@ -881,7 +932,6 @@ def stop_processing():
 
     with data_lock:
         threads = []
-        # Reset state
         for i in list(reader_data.keys()):
             reader_data[i] = {
                 "readerIndex": i,
@@ -894,7 +944,6 @@ def stop_processing():
             }
     logging.info(f"Stopped processing for all readers at {time.strftime('%H:%M:%S', time.localtime())}")
 
-# Flask routes
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -998,10 +1047,10 @@ def handle_disconnect():
     logging.info(f"Client disconnected from /logs at {time.strftime('%H:%M:%S', time.localtime())}")
 
 
-# --- THIS BLOCK IS MODIFIED ---
 if __name__ == "__main__":
     logging.info("Application starting... Auto-starting reader processing.")
-    start_processing()  # <-- This is the new line
+    start_processing() 
 
     logging.info("Starting web server.")
     socketio.run(app, debug=False, host='0.0.0.0', port=WEB_PORT, allow_unsafe_werkzeug=True)
+

@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Graphs</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>
+  <style>
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: linear-gradient(to right, #dbeafe, #eff6ff);
+      min-height: 100vh;
+      padding-top: 15px;
+    }
+
+    .dashboard-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 25px;
+      padding: 10px 20px;
+      background-color: white;
+      box-shadow: 0 5px 20px rgba(0,0,0,0.05);
+    }
+
+    .dashboard-header h2 {
+      margin: 0 auto;
+      color: #0369a1;
+      font-weight: bold;
+    }
+
+    .nav-button, .logout-button {
+      padding: 8px 14px;
+      font-size: 14px;
+      border: none;
+      border-radius: 6px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background-color 0.3s ease;
+    }
+
+    .nav-button {
+      background-color: #e0f2fe;
+      color: #0369a1;
+    }
+
+    .nav-button:hover {
+      background-color: #bae6fd;
+    }
+
+    .logout-button {
+      background-color: #f87171;
+      color: white;
+    }
+
+    .logout-button:hover {
+      background-color: #ef4444;
+    }
+
+    .graph-container {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 20px;
+      padding: 0 20px;
+    }
+
+    @media (max-width: 992px) {
+      .graph-container {
+        grid-template-columns: repeat(2, 1fr);
+      }
+    }
+
+    @media (max-width: 576px) {
+      .graph-container {
+        grid-template-columns: repeat(1, 1fr);
+      }
+    }
+
+    .graph-wrapper {
+      background-color: white;
+      border-radius: 12px;
+      box-shadow: 0 8px 20px rgba(0,0,0,0.05);
+      padding: 20px;
+      height: 300px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    canvas {
+      width: 100% !important;
+      height: 100% !important;
+    }
+
+    .error-message {
+      color: #dc2626;
+      font-weight: bold;
+      text-align: center;
+      margin: 0.5rem 0;
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container-fluid">
+    <div class="dashboard-header">
+      <div>
+        <button class="nav-button" onclick="window.location.href='/'">Home</button>
+        <button class="nav-button" onclick="window.location.href='/graphs.html'">Graphs</button>
+        <button class="nav-button" onclick="window.location.href='/logs.html'">Logs</button>
+      </div>
+      <h2>Smart Card Reader Dashboard</h2>
+      <div>
+        <button class="logout-button" onclick="logout()">Logout</button>
+      </div>
+    </div>
+
+    <div id="errorContainer" class="error-message" style="display: none;"></div>
+    <div class="graph-container">
+      <div class="graph-wrapper"><canvas id="readerStatusChart"></canvas></div>
+      <div class="graph-wrapper"><canvas id="authenticationStatusChart"></canvas></div>
+      <div class="graph-wrapper"><canvas id="cardPresenceTimeChart"></canvas></div>
+      <div class="graph-wrapper"><canvas id="companyDistributionChart"></canvas></div>
+      <div class="graph-wrapper"><canvas id="readerConnectionChart"></canvas></div>
+      <div class="graph-wrapper"><canvas id="authenticationFailureChart"></canvas></div>
+    </div>
+  </div>
+
+  <script>
+    console.log('Chart.js loaded:', typeof Chart !== 'undefined');
+
+    function logout() {
+      fetch('/logout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      })
+      .then(res => res.json())
+      .then(data => {
+        if (data.status === 'success') {
+          window.location.href = '/';
+        } else {
+          alert('Logout failed: ' + data.message);
+        }
+      }).catch(err => alert('Error: ' + err.message));
+    }
+
+    const mockData = [
+      { readerIndex: 0, status: 'Connected', authentication: 'Authenticated', presentTime: '00:01:30', companyName: 'Company A' },
+      { readerIndex: 1, status: 'Disconnected', authentication: 'Failed', presentTime: 'N/A', companyName: 'Company B' },
+      { readerIndex: 2, status: 'Card-Connected', authentication: 'Pending', presentTime: '00:02:00', companyName: 'Company A' },
+      { readerIndex: 3, status: 'Connected', authentication: 'Authenticated', presentTime: '00:00:45', companyName: 'Company C' }
+    ];
+
+    let charts = {
+      readerStatus: null,
+      authenticationStatus: null,
+      cardPresenceTime: null,
+      companyDistribution: null,
+      readerConnection: null,
+      authenticationFailure: null
+    };
+
+    const chartOptions = {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { position: 'top', labels: { font: { size: 10, family: 'Segoe UI' } } },
+        title: { display: true, font: { size: 14, weight: 'bold' } },
+        tooltip: { backgroundColor: '#000', titleFont: { size: 12 }, bodyFont: { size: 10 } }
+      }
+    };
+
+    const ctx = document.createElement('canvas').getContext('2d');
+    const gradient = ctx.createLinearGradient(0, 0, 0, 180);
+    gradient.addColorStop(0, '#4CAF50');
+    gradient.addColorStop(1, '#2196F3');
+
+    function initializeCharts(data) {
+      console.log('Initializing charts with data:', data);
+      if (typeof Chart === 'undefined') {
+        console.error('Chart.js not loaded');
+        return;
+      }
+
+      // Reader Status Chart
+      const statusCounts = data.reduce((acc, r) => {
+        acc[r.status] = (acc[r.status] || 0) + 1;
+        return acc;
+      }, {});
+      charts.readerStatus = new Chart(document.getElementById('readerStatusChart'), {
+        type: 'bar',
+        data: {
+          labels: Object.keys(statusCounts),
+          datasets: [{
+            label: 'Reader Status',
+            data: Object.values(statusCounts),
+            backgroundColor: gradient,
+            borderRadius: 3
+          }]
+        },
+        options: {
+          ...chartOptions,
+          plugins: { ...chartOptions.plugins, title: { ...chartOptions.plugins.title, text: 'Reader Status' } },
+          scales: {
+            y: { beginAtZero: true, title: { display: true, text: 'Count' }, ticks: { font: { size: 10 } } },
+            x: { title: { display: true, text: 'Status' }, ticks: { font: { size: 10 } } }
+          }
+        }
+      });
+
+      // Authentication Status Chart
+      const authCounts = data.reduce((acc, r) => {
+        acc[r.authentication] = (acc[r.authentication] || 0) + 1;
+        return acc;
+      }, {});
+      charts.authenticationStatus = new Chart(document.getElementById('authenticationStatusChart'), {
+        type: 'pie',
+        data: {
+          labels: Object.keys(authCounts),
+          datasets: [{
+            label: 'Auth Status',
+            data: Object.values(authCounts),
+            backgroundColor: ['#2196F3', '#4CAF50', '#F44336', '#FF9800'],
+            borderWidth: 0.5
+          }]
+        },
+        options: {
+          ...chartOptions,
+          plugins: { ...chartOptions.plugins, title: { ...chartOptions.plugins.title, text: 'Authentication Status' } }
+        }
+      });
+
+      // Card Presence Time Chart
+      const presenceTimes = data.map((r) => {
+        if (r.presentTime === 'N/A') return 0;
+        const [h, m, s] = r.presentTime.split(':').map(Number);
+        return h * 3600 + m * 60 + s;
+      });
+      charts.cardPresenceTime = new Chart(document.getElementById('cardPresenceTimeChart'), {
+        type: 'bar',
+        data: {
+          labels: data.map((r) => `Reader ${r.readerIndex + 1}`),
+          datasets: [{
+            label: 'Presence Time (s)',
+            data: presenceTimes,
+            backgroundColor: gradient,
+            borderRadius: 3
+          }]
+        },
+        options: {
+          ...chartOptions,
+          plugins: { ...chartOptions.plugins, title: { ...chartOptions.plugins.title, text: 'Card Presence Time' } },
+          scales: {
+            y: { beginAtZero: true, title: { display: true, text: 'Seconds' } },
+            x: { title: { display: true, text: 'Reader' } }
+          }
+        }
+      });
+
+      // Company Distribution Chart
+      const companyCounts = data.reduce((acc, r) => {
+        acc[r.companyName] = (acc[r.companyName] || 0) + 1;
+        return acc;
+      }, {});
+      charts.companyDistribution = new Chart(document.getElementById('companyDistributionChart'), {
+        type: 'doughnut',
+        data: {
+          labels: Object.keys(companyCounts),
+          datasets: [{
+            label: 'Companies',
+            data: Object.values(companyCounts),
+            backgroundColor: ['#FF5722', '#4CAF50', '#2196F3', '#FFC107'],
+            borderWidth: 0.5
+          }]
+        },
+        options: {
+          ...chartOptions,
+          plugins: { ...chartOptions.plugins, title: { ...chartOptions.plugins.title, text: 'Company Distribution' } }
+        }
+      });
+
+      // Reader Connection Chart
+      const connectionCounts = data.reduce((acc, r) => {
+        const key = r.status === 'Connected' || r.status === 'Card-Connected' ? 'Connected' : 'Disconnected';
+        acc[key] = (acc[key] || 0) + 1;
+        return acc;
+      }, {});
+      charts.readerConnection = new Chart(document.getElementById('readerConnectionChart'), {
+        type: 'bar',
+        data: {
+          labels: Object.keys(connectionCounts),
+          datasets: [{
+            label: 'Connections',
+            data: Object.values(connectionCounts),
+            backgroundColor: gradient,
+            borderRadius: 3
+          }]
+        },
+        options: {
+          ...chartOptions,
+          plugins: { ...chartOptions.plugins, title: { ...chartOptions.plugins.title, text: 'Connection Status' } },
+          scales: {
+            y: { beginAtZero: true },
+            x: {}
+          }
+        }
+      });
+
+      // Authentication Failure Chart
+      const failureCounts = data.reduce((acc, r) => {
+        const key = r.authentication.includes('Failed') ? 'Failed' : 'Non-Failed';
+        acc[key] = (acc[key] || 0) + 1;
+        return acc;
+      }, {});
+      charts.authenticationFailure = new Chart(document.getElementById('authenticationFailureChart'), {
+        type: 'pie',
+        data: {
+          labels: Object.keys(failureCounts),
+          datasets: [{
+            label: 'Auth Failures',
+            data: Object.values(failureCounts),
+            backgroundColor: ['#F44336', '#4CAF50'],
+            borderWidth: 0.5
+          }]
+        },
+        options: {
+          ...chartOptions,
+          plugins: { ...chartOptions.plugins, title: { ...chartOptions.plugins.title, text: 'Authentication Failures' } }
+        }
+      });
+    }
+
+    function updateGraphs(data) {
+      console.log('Updating charts with data:', data);
+      if (typeof Chart === 'undefined') {
+        console.error('Chart.js not loaded');
+        return;
+      }
+
+      // Update Reader Status Chart
+      const statusCounts = data.reduce((acc, r) => {
+        acc[r.status] = (acc[r.status] || 0) + 1;
+        return acc;
+      }, {});
+      charts.readerStatus.data.labels = Object.keys(statusCounts);
+      charts.readerStatus.data.datasets[0].data = Object.values(statusCounts);
+      charts.readerStatus.update();
+
+      // Update Authentication Status Chart
+      const authCounts = data.reduce((acc, r) => {
+        acc[r.authentication] = (acc[r.authentication] || 0) + 1;
+        return acc;
+      }, {});
+      charts.authenticationStatus.data.labels = Object.keys(authCounts);
+      charts.authenticationStatus.data.datasets[0].data = Object.values(authCounts);
+      charts.authenticationStatus.update();
+
+      // Update Card Presence Time Chart
+      const presenceTimes = data.map((r) => {
+        if (r.presentTime === 'N/A') return 0;
+        const [h, m, s] = r.presentTime.split(':').map(Number);
+        return h * 3600 + m * 60 + s;
+      });
+      charts.cardPresenceTime.data.labels = data.map((r) => `Reader ${r.readerIndex + 1}`);
+      charts.cardPresenceTime.data.datasets[0].data = presenceTimes;
+      charts.cardPresenceTime.update();
+
+      // Update Company Distribution Chart
+      const companyCounts = data.reduce((acc, r) => {
+        acc[r.companyName] = (acc[r.companyName] || 0) + 1;
+        return acc;
+      }, {});
+      charts.companyDistribution.data.labels = Object.keys(companyCounts);
+      charts.companyDistribution.data.datasets[0].data = Object.values(companyCounts);
+      charts.companyDistribution.update();
+
+      // Update Reader Connection Chart
+      const connectionCounts = data.reduce((acc, r) => {
+        const key = r.status === 'Connected' || r.status === 'Card-Connected' ? 'Connected' : 'Disconnected';
+        acc[key] = (acc[key] || 0) + 1;
+        return acc;
+      }, {});
+      charts.readerConnection.data.labels = Object.keys(connectionCounts);
+      charts.readerConnection.data.datasets[0].data = Object.values(connectionCounts);
+      charts.readerConnection.update();
+
+      // Update Authentication Failure Chart
+      const failureCounts = data.reduce((acc, r) => {
+        const key = r.authentication.includes('Failed') ? 'Failed' : 'Non-Failed';
+        acc[key] = (acc[key] || 0) + 1;
+        return acc;
+      }, {});
+      charts.authenticationFailure.data.labels = Object.keys(failureCounts);
+      charts.authenticationFailure.data.datasets[0].data = Object.values(failureCounts);
+      charts.authenticationFailure.update();
+    }
+
+    async function fetchReaderData() {
+      try {
+        const res = await fetch('/readers');
+        const result = await res.json();
+        console.log('Fetched data:', result);
+        if (result.status === 'success' && Array.isArray(result.data) && result.data.length > 0) {
+          if (!charts.readerStatus) {
+            initializeCharts(result.data);
+          } else {
+            updateGraphs(result.data);
+          }
+          document.getElementById('errorContainer').style.display = 'none';
+        } else {
+          if (!charts.readerStatus) {
+            initializeCharts(mockData);
+          } else {
+            updateGraphs(mockData);
+          }
+          document.getElementById('errorContainer').textContent = 'No data available. Showing mock data.';
+          document.getElementById('errorContainer').style.display = 'block';
+        }
+      } catch (e) {
+        console.error('Fetch error:', e);
+        if (!charts.readerStatus) {
+          initializeCharts(mockData);
+        } else {
+          updateGraphs(mockData);
+        }
+        document.getElementById('errorContainer').textContent = 'Failed to load data. Showing mock data.';
+        document.getElementById('errorContainer').style.display = 'block';
+      }
+    }
+
+    fetchReaderData();
+    setInterval(fetchReaderData, 5000);
+  </script>
+</body>
+</html>
