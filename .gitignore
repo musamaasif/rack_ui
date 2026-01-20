@@ -1,0 +1,5 @@
+*.log
+.DS_Store
+static/
+templates/*.log
+templates/.DS_Store
