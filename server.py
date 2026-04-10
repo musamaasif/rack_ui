@@ -372,7 +372,7 @@ def process_card(reader_index):
     sock = None
     company_name = None
     vehicle_schedule_id = None
-    auth_start_time = 0 # <-- NEW: Track start time of auth
+    auth_start_time = 0 # <-- Tracks start time of auth session
     has_reconnected = False
     prev_auth_status = -1
     combined_identifier = None
@@ -554,8 +554,8 @@ def process_card(reader_index):
                     sock = None
                     company_name = None
                     combined_identifier = None
-                    vehicle_schedule_id = None # Reset session on removal
-                    auth_start_time = 0        # Reset timer
+                    vehicle_schedule_id = None
+                    auth_start_time = 0
                     inserted_sent = False
                     connect_failures = 0 
                 else:
@@ -589,6 +589,8 @@ def process_card(reader_index):
                     connection = None
                     company_name = None
                     combined_identifier = None
+                    vehicle_schedule_id = None
+                    auth_start_time = 0
                     inserted_sent = False
                     time.sleep(REQUEST_INTERVAL) 
                     continue
@@ -596,12 +598,10 @@ def process_card(reader_index):
                 continue
 
             if isinstance(response_data.get("data"), dict):
-                # --- NEW: Check if new session ID to reset timer ---
                 new_sid = response_data["data"].get("vehicle_schedule_id")
                 if new_sid != vehicle_schedule_id:
                     vehicle_schedule_id = new_sid
-                    auth_start_time = time.time() # Start/Reset timer for this session
-                # ---------------------------------------------------
+                    auth_start_time = time.time()
 
             raw_status = response_data.get("data", {}).get(combined_identifier.lower(), -1)
             try:
@@ -676,68 +676,37 @@ def process_card(reader_index):
                 apdu = data_apdu.get('apdu')
                 vehicle_schedule_id = data_apdu.get('vehicle_schedule_id', vehicle_schedule_id)
 
-                while apdu and apdu != "00000000000000":
+                # --- UPDATED APDU LOOP ---
+                while apdu:
+                    # 1. 60s TIMEOUT CHECK
+                    if auth_start_time > 0 and (time.time() - auth_start_time) > AUTH_TIMEOUT_SEC:
+                        logging.error(f"Thread {thread_id}: Auth timed out (> {AUTH_TIMEOUT_SEC}s), forcefully resetting session.")
+                        if sock and combined_identifier:
+                            send_card_status(sock, combined_identifier, thread_id, "removed", vehicle_schedule_id)
+                        
+                        vehicle_schedule_id = None 
+                        auth_start_time = 0
+                        with data_lock:
+                            _append_history({
+                                "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
+                                "readerIndex": reader_index, "status": "Disconnected",
+                                "companyName": "N/A", "atr": "N/A", "authentication": "Unknown", "presentTime": "N/A"
+                            })
+                            rd = reader_data.get(thread_id)
+                            if rd:
+                                rd.update({"status": "Disconnected", "presentTime": "N/A",
+                                           "cardInsertTime": None, "companyName": "N/A"})
+                        try: connection.disconnect()
+                        except Exception: pass
+                        connection = None
+                        company_name = None
+                        combined_identifier = None
+                        inserted_sent = False
+                        break 
+
+                    # 2. SUCCESS SIGNAL
                     if apdu == "11111111111111":
-                        logging.debug(f"Thread {thread_id}: Skipping APDU {apdu}")
-                        data_apdu = fetch_apdu_from_server(sock, combined_identifier, thread_id, vehicle_schedule_id=vehicle_schedule_id)
-                        if not data_apdu:
-                            break
-                        apdu = data_apdu.get('apdu')
-                        vehicle_schedule_id = data_apdu.get('vehicle_schedule_id', vehicle_schedule_id)
-                        continue
-
-                    data, status = execute_apdu(connection, apdu, thread_id)
-                    
-                    # --- CHECK TIMEOUT ON FAILURE ---
-                    if data is None or status is None:
-                        logging.error(f"Thread {thread_id}: Auth APDU {apdu} failed")
-                        
-                        # Only RESET if we have exceeded the 60s timeout
-                        if (time.time() - auth_start_time) > AUTH_TIMEOUT_SEC:
-                            logging.error(f"Thread {thread_id}: Auth timed out (> {AUTH_TIMEOUT_SEC}s), resetting session.")
-                            vehicle_schedule_id = None # Force fresh start next loop
-                            auth_start_time = 0
-                            
-                            # Log failure to history
-                            with data_lock:
-                                _append_history({
-                                    "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
-                                    "readerIndex": reader_index, "status": "Disconnected",
-                                    "companyName": "N/A", "atr": "N/A", "authentication": "Unknown", "presentTime": "N/A"
-                                })
-                                rd = reader_data.get(thread_id)
-                                if rd:
-                                    rd.update({"status": "Disconnected", "presentTime": "N/A",
-                                               "cardInsertTime": None, "companyName": "N/A"})
-                            try:
-                                connection.disconnect()
-                            except Exception:
-                                pass
-                            connection = None
-                            company_name = None
-                            combined_identifier = None
-                            inserted_sent = False
-                        
-                        # Always break inner loop to retry (either with old ID or new None)
-                        break
-                    # ------------------------------------------
-
-                    data_apdu = fetch_apdu_from_server(
-                        sock, combined_identifier, thread_id,
-                        response_data=data, status=status, pre_apdu=apdu,
-                        vehicle_schedule_id=vehicle_schedule_id
-                    )
-                    if not data_apdu:
-                        break
-                    apdu = data_apdu.get('apdu')
-                    vehicle_schedule_id = data_apdu.get('vehicle_schedule_id', vehicle_schedule_id)
-
-                if apdu == "00000000000000":
-                    data, status = execute_apdu(connection, apdu, thread_id)
-                    if data is None or status is None:
-                        logging.error(f"Thread {thread_id}: Final APDU {apdu} failed")
-                    else:
-                        logging.info(f"Thread {thread_id}: Authentication complete")
+                        logging.info(f"Thread {thread_id}: Authentication COMPLETE (Success signal 11111111111111 received)")
                         with data_lock:
                             _append_history({
                                 "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
@@ -755,28 +724,67 @@ def process_card(reader_index):
                                     "presentTime": format_duration(0),
                                     "companyName": company_name if company_name else rd.get("companyName", "N/A")
                                 })
-                        try:
-                            connection.disconnect()
-                        except Exception:
-                            pass
+                        
+                        vehicle_schedule_id = None
+                        auth_start_time = 0
+                        try: connection.disconnect()
+                        except Exception: pass
+                        
                         connection = connect_reader(reader_index)
                         if not connection:
                             with data_lock:
-                                _append_history({
-                                    "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
-                                    "readerIndex": reader_index, "status": "Disconnected",
-                                    "companyName": "N/A", "atr": "N/A", "authentication": "Unknown", "presentTime": "N/A"
-                                })
                                 rd = reader_data.get(thread_id)
-                                if rd:
-                                    rd.update({"status": "Disconnected", "presentTime": "N/A",
-                                               "cardInsertTime": None, "companyName": "N/A"})
+                                if rd: rd.update({"status": "Disconnected", "presentTime": "N/A", "cardInsertTime": None, "companyName": "N/A"})
                             company_name = None
                             combined_identifier = None
                             inserted_sent = False
-                            continue
+                            break
+                        
                         has_reconnected = True
                         last_card_ok = time.time()
+                        break
+
+                    # 3. RESET/FAILURE SIGNAL
+                    if apdu == "00000000000000":
+                        logging.warning(f"Thread {thread_id}: Server requested CARD RESET (00000000000000 received).")
+                        
+                        vehicle_schedule_id = None
+                        auth_start_time = 0
+                        try: connection.disconnect()
+                        except Exception: pass
+                        
+                        connection = connect_reader(reader_index)
+                        if not connection:
+                            with data_lock:
+                                rd = reader_data.get(thread_id)
+                                if rd: rd.update({"status": "Disconnected", "presentTime": "N/A", "cardInsertTime": None, "companyName": "N/A"})
+                            company_name = None
+                            combined_identifier = None
+                            inserted_sent = False
+                            break
+                        
+                        has_reconnected = True
+                        last_card_ok = time.time()
+                        break 
+
+                    # 4. NORMAL APDU EXECUTION
+                    data, status = execute_apdu(connection, apdu, thread_id)
+                    
+                    if data is None or status is None:
+                        logging.error(f"Thread {thread_id}: Auth APDU {apdu} failed (hardware/connection drop)")
+                        break 
+
+                    data_apdu = fetch_apdu_from_server(
+                        sock, combined_identifier, thread_id,
+                        response_data=data, status=status, pre_apdu=apdu,
+                        vehicle_schedule_id=vehicle_schedule_id
+                    )
+                    if not data_apdu:
+                        break
+                    
+                    apdu = data_apdu.get('apdu')
+                    vehicle_schedule_id = data_apdu.get('vehicle_schedule_id', vehicle_schedule_id)
+                # -----------------------------
 
             elif auth_status == 0:
                 if auth_status != prev_auth_status:
@@ -816,6 +824,10 @@ def process_card(reader_index):
 
             elif auth_status > 1 and not has_reconnected and prev_auth_status <= 1:
                 logging.info(f"Thread {thread_id}: Auth status {auth_status}>1 → reconnect reader")
+                
+                vehicle_schedule_id = None
+                auth_start_time = 0
+
                 with data_lock:
                     _append_history({
                         "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
